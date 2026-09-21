@@ -42,6 +42,11 @@ from usermode. Kernel-side AOB/value scan = DMA-style speed without hardware.
 - **Memory Viewer** — hex dump + WriteBytes, separate window like CE
 - **Legend Table (.ltb)** — File → New / Open / Save; tiny XML storing
   active, desc, addr/module, type, signed/hex, pointer chain and bytes
+- **Pointer Scan** — CE-style reverse brute force: table/found row →
+  options (max offsets/node, threads, max offset, levels) → `.lps`
+  checkpoint → threaded progress → results
+  (`Base Address | Offset 0-4 | Points to`) → double-click adds →
+  **Rescan** filters against the new address + saves checkpoint again
 - **Masquerade** — PEB-as-Chrome, fake Chrome mutex + version info,
   patched `DbgBreakPoint`, random window classes/cover captions
 - **Writes that land** — driver `MdlWrite` fallback handles `PAGE_READONLY`

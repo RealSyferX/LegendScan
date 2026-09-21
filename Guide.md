@@ -82,6 +82,16 @@ hex-string box → **Write** (verified, MDL fallback covers read-only pages).
 - **Pointer**: find dynamic address → Change Address → tick Pointer →
   Add Offset as needed → OK → `P->…` entry, freeze-safe across restarts
   (combine with `"mod"+off` base for full ASLR-proofing).
+- **Pointer Scan** (auto-find the chain): right-click a table/found row →
+  `Pointer Scan for This Address` (or Scan menu) → options
+  (`Max different offsets per node` 3, threads 4, `Maximum offset` 4095,
+  `Max level` 1–5) → pick `.lps` checkpoint file → watch progress
+  (paths evaluated, results, Stop) → results window
+  (`Base Address | Offset 0-4 | Points to`) → double-click adds it.
+  After a game restart: results window → **Rescan** → enter the new
+  address → keeps only surviving paths → saves checkpoint again.
+  Level 1 = holders pointing straight at your address; each level walks
+  one hop further back until a static module closes the path.
 - **Static**: Change Address → `"game.exe"+DA059C` → OK → survives restart.
 
 ## Safety rules

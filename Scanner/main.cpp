@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -179,7 +181,7 @@ static void SpoofModuleDescription() {
     VirtualProtect(pVer, szVer, oldProt, &oldProt);
 }
 
-static char g_clsMain[16]{}, g_clsDlg[16]{}, g_clsMem[16]{};
+static char g_clsMain[16]{}, g_clsDlg[16]{}, g_clsMem[16]{}, g_clsPSP[16]{}, g_clsPSR[16]{};
 
 //=================================================================
 //  Globals
@@ -265,7 +267,12 @@ enum {
     // process list dialog
     PL_LIST = 1010, PL_REFRESH, PL_EDIT,
     // table/found context menu
-    CTX_DEL = 9110, CTX_VAL, CTX_TYPE, CTX_DESC, CTX_ADDR, CTX_ADD,
+    CTX_DEL = 9110, CTX_VAL, CTX_TYPE, CTX_DESC, CTX_ADDR, CTX_ADD, CTX_PS,
+    // pointer scan windows
+    PS_PROG_STAT = 1060, PS_STOP,
+    PS_RES_LIST = 1062, PS_RESCAN, PS_ADD, PS_SAVE, PS_CLOSEB,
+    PSO_ADDR = 1070, PSO_DIFF, PSO_THR, PSO_MAXOFF, PSO_LVL,
+    PSR_ADDR = 1080,
     // settings dialog
     SET_MODCHK = 1040,
     // mem viewer popup
@@ -897,6 +904,252 @@ static void FreezeThread() {
             g_drv->write_bytes(f, e.bytes, e.len);
         }
     }
+}
+
+//=================================================================
+//  POINTER SCAN (CE-style reverse brute force)
+//  L0 = target address. Each level: find 8B-aligned qwords in writable
+//  memory with value V in [t-maxOff, t] for any frontier t -> holder H
+//  gives (H, off=t-V). Holders inside a module close a static path.
+//  Rescan re-resolves saved paths against a new target (checkpoint flow).
+//=================================================================
+struct PSPath {
+    std::string mod;
+    UINT64 modOff = 0;
+    UINT64 offs[PTR_MAX]{};
+    int nOff = 0;
+    UINT64 pointsTo = 0;
+};
+static bool TableFileDlg(bool save, char* out, int outSz); // defined in Legend Table section
+static void PS_ForFoundRow();
+struct PSState {
+    std::atomic<bool> run{ false };
+    std::atomic<bool> stop{ false };
+    std::atomic<uint64_t> paths{ 0 };   // qwords evaluated
+    std::atomic<uint64_t> results{ 0 };
+    std::atomic<int> level{ 0 };
+    std::atomic<int> regionsDone{ 0 };
+    std::atomic<int> regionsTotal{ 0 };
+    DWORD startTick = 0;
+    UINT64 target = 0;
+    int vtype = V_U32;
+    ULONG vlen = 4;
+    int maxLevel = 5, maxOff = 4095, maxDiff = 3, nThreads = 4;
+    std::string savePath;
+};
+static PSState g_ps;
+static std::vector<PSPath> g_psRes;
+static std::mutex g_psResMtx;
+static HWND g_psProg = nullptr; // progress window
+static HWND g_psWin = nullptr;  // results window
+static std::atomic<bool> g_pscanning{ false };
+
+static bool ps_in_module(UINT64 a, const std::vector<ModInfo>& mods, size_t& idx) {
+    for (size_t i = 0; i < mods.size(); i++) {
+        if (mods[i].size && a >= mods[i].base && a < mods[i].base + mods[i].size) { idx = i; return true; }
+    }
+    return false;
+}
+
+struct PSCand { UINT64 holder = 0; UINT64 off = 0; UINT64 parent = 0; };
+
+// One level of reverse scan, regions fanned over N threads (own driver handles)
+static void PSLevel(const std::vector<UINT64>& frontier, const std::vector<LsRegion>& regs,
+    int maxOff, std::vector<PSCand>& out, int nThreads) {
+    if (frontier.empty() || regs.empty()) return;
+    std::vector<UINT64> sorted = frontier;
+    std::sort(sorted.begin(), sorted.end());
+    std::atomic<size_t> ri{ 0 };
+    std::mutex mtx;
+    auto worker = [&]() {
+        HideThreadFromDebugger();
+        SSTR(_dev, _s_dev);
+        ls_driver drv(_dev, g_pid);
+        if (!drv.valid()) return;
+        std::vector<BYTE> chunk;
+        chunk.resize(0x100000);
+        std::vector<PSCand> local;
+        local.reserve(8192);
+        for (;;) {
+            if (g_ps.stop || !g_running) break;
+            size_t idx = ri++;
+            if (idx >= regs.size()) break;
+            const LsRegion& r = regs[idx];
+            UINT64 base = r.base;
+            UINT64 left = r.size;
+            UINT64 off = 0;
+            while (left && !g_ps.stop) {
+                SIZE_T want = (SIZE_T)(std::min<UINT64>)(left, chunk.size());
+                // 8B-align the window
+                UINT64 a0 = (base + off + 7) & ~7ULL;
+                UINT64 a1 = base + off + want;
+                if (a1 <= a0 || a1 - a0 < 8) { off += want; left -= want; continue; }
+                SIZE_T rwant = (SIZE_T)(a1 - a0);
+                if (!drv.read_raw_checked(a0, chunk.data(), rwant)) { off += want; left -= want; continue; }
+                for (SIZE_T i = 0; i + 8 <= rwant; i += 8) {
+                    UINT64 v = 0;
+                    memcpy(&v, chunk.data() + i, 8);
+                    g_ps.paths++;
+                    // frontier targets t with V <= t <= V+maxOff
+                    auto lo = std::lower_bound(sorted.begin(), sorted.end(), v);
+                    for (auto it = lo; it != sorted.end(); it++) {
+                        UINT64 t = *it;
+                        if (t - v > (UINT64)maxOff) break;
+                        PSCand c{}; c.holder = a0 + i; c.off = t - v; c.parent = t;
+                        local.push_back(c);
+                        if (local.size() >= 8192) {
+                            std::lock_guard<std::mutex> lk(mtx);
+                            out.insert(out.end(), local.begin(), local.end());
+                            local.clear();
+                        }
+                    }
+                }
+                off += want; left -= want;
+            }
+            g_ps.regionsDone++;
+        }
+        if (!local.empty()) {
+            std::lock_guard<std::mutex> lk(mtx);
+            out.insert(out.end(), local.begin(), local.end());
+        }
+    };
+    if (nThreads < 1) nThreads = 1;
+    if (nThreads > 16) nThreads = 16;
+    std::vector<std::thread> th;
+    for (int i = 0; i < nThreads; i++) th.emplace_back(worker);
+    for (auto& t : th) t.join();
+}
+
+// Full multilevel scan (runs on a detached thread)
+static void PSScanThread(UINT64 target, int vtype, ULONG vlen, int maxLevel, int maxOff, int maxDiff, int nThreads, std::string savePath) {
+    HideThreadFromDebugger();
+    g_pscanning = true;
+    g_ps.run = true; g_ps.stop = false;
+    g_ps.paths = 0; g_ps.results = 0; g_ps.level = 0;
+    g_ps.target = target; g_ps.vtype = vtype; g_ps.vlen = vlen;
+    g_ps.maxLevel = maxLevel; g_ps.maxOff = maxOff; g_ps.nThreads = nThreads;
+    g_ps.savePath = savePath;
+    g_ps.startTick = GetTickCount();
+    PostMessageA(g_hwnd, WM_SCAN_DONE, 3, 0); // open progress window
+
+    // snapshot writable regions + modules once
+    std::vector<LsRegion> regs;
+    std::vector<ModInfo> mods;
+    if (g_drv && g_attached) {
+        auto all = g_drv->regions();
+        for (auto& r : all) {
+            if (r.state != 0x1000) continue;
+            if (!readable_protect(r.protect)) continue;
+            if (!writeable_protect(r.protect)) continue; // pointers live in RW memory
+            if (r.size < 8 || r.size > 0x40000000) continue;
+            regs.push_back(r);
+        }
+        mods = g_mods;
+    }
+    // module ranges sorted for binary search-ish checks
+    std::sort(mods.begin(), mods.end(), [](const ModInfo& a, const ModInfo& b) { return a.base < b.base; });
+
+    std::vector<UINT64> frontier;
+    frontier.push_back(target);
+    std::unordered_map<UINT64, std::pair<UINT64, UINT64>> parent; // holder -> (parentTarget, off)
+    std::unordered_set<UINT64> visited;
+    visited.insert(target);
+    std::vector<PSPath> results;
+
+    const size_t LVL_CAP = 500000;
+    const size_t RES_CAP = 500000;
+
+    for (int lvl = 1; lvl <= maxLevel && !g_ps.stop && g_running; lvl++) {
+        g_ps.level = lvl;
+        g_ps.regionsDone = 0;
+        g_ps.regionsTotal = (int)regs.size();
+        std::vector<PSCand> cands;
+        PSLevel(frontier, regs, maxOff, cands, nThreads);
+        if (g_ps.stop || !g_running) break;
+        if (cands.empty()) break;
+        // sort by (holder, off), dedup, cap distinct offsets per holder
+        std::sort(cands.begin(), cands.end(), [](const PSCand& a, const PSCand& b) {
+            return a.holder < b.holder || (a.holder == b.holder && a.off < b.off);
+        });
+        std::vector<UINT64> next;
+        next.reserve(cands.size());
+        size_t i = 0;
+        while (i < cands.size() && next.size() < LVL_CAP && results.size() < RES_CAP) {
+            size_t j = i;
+            int kept = 0;
+            while (j < cands.size() && cands[j].holder == cands[i].holder) {
+                if (kept < maxDiff && !visited.count(cands[j].holder)) {
+                    UINT64 H = cands[j].holder;
+                    size_t mi = 0;
+                    if (ps_in_module(H, mods, mi)) {
+                        // static path closed — reconstruct chain H -> ... -> target
+                        PSPath p;
+                        p.mod = mods[mi].name;
+                        p.modOff = H - mods[mi].base;
+                        UINT64 walk[PTR_MAX + 1]{};
+                        UINT64 no = cands[j].off;
+                        walk[0] = H;
+                        std::vector<UINT64> ro;
+                        ro.push_back(no);
+                        UINT64 node = cands[j].parent;
+                        while (node != target) {
+                            auto f = parent.find(node);
+                            if (f == parent.end()) break;
+                            ro.push_back(f->second.second);
+                            node = f->second.first;
+                        }
+                        if (node != target) { j++; continue; } // broken link (shouldn't happen)
+                        p.nOff = (int)(std::min<size_t>)(ro.size(), PTR_MAX);
+                        for (int k = 0; k < p.nOff; k++) p.offs[k] = ro[(size_t)k];
+                        p.pointsTo = target;
+                        results.push_back(p);
+                        g_ps.results = results.size();
+                    }
+                    else {
+                        parent[H] = { cands[j].parent, cands[j].off };
+                        next.push_back(H);
+                    }
+                    visited.insert(H);
+                    kept++;
+                }
+                j++;
+            }
+            i = j;
+            if (g_ps.stop) break;
+        }
+        // unique next frontier
+        std::sort(next.begin(), next.end());
+        next.erase(std::unique(next.begin(), next.end()), next.end());
+        frontier.swap(next);
+        if (frontier.empty()) break;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_psResMtx);
+        g_psRes.swap(results);
+    }
+    // checkpoint file (CE asks to save results — ours writes the chosen path)
+    if (!savePath.empty() && !g_psRes.empty()) {
+        FILE* f = nullptr;
+        fopen_s(&f, savePath.c_str(), "wb");
+        if (f) {
+            fprintf(f, "<LegendPointers target=\"%llX\" vtype=\"%d\" vlen=\"%lu\">\n",
+                (unsigned long long)target, vtype, vlen);
+            std::lock_guard<std::mutex> lk(g_psResMtx);
+            for (auto& p : g_psRes) {
+                char offs[128]{};
+                for (int k = 0; k < p.nOff; k++)
+                    snprintf(offs + strlen(offs), sizeof(offs) - strlen(offs), "%s%llX", k ? "," : "", (unsigned long long)p.offs[k]);
+                fprintf(f, "<P mod=\"%s\" moff=\"%llX\" n=\"%d\" offs=\"%s\" points=\"%llX\"/>\n",
+                    p.mod.c_str(), (unsigned long long)p.modOff, p.nOff, offs, (unsigned long long)p.pointsTo);
+            }
+            fprintf(f, "</LegendPointers>\n");
+            fclose(f);
+        }
+    }
+    g_ps.run = false;
+    g_pscanning = false;
+    PostMessageA(g_hwnd, WM_SCAN_DONE, 4, 0); // done -> open results window
 }
 
 //=================================================================
@@ -1614,6 +1867,301 @@ static void doAddFoundToTableDirect() {
 }
 
 //=================================================================
+//  POINTER SCAN UI — options / progress / results / rescan (.LPS)
+//=================================================================
+static bool g_ctxFound = false; // context menu source: found list vs table
+
+static void PS_SaveList(const char* path) {
+    FILE* f = nullptr;
+    fopen_s(&f, path, "wb");
+    if (!f) { setStatus("Pointerlist save failed"); return; }
+    fprintf(f, "<LegendPointers target=\"%llX\" vtype=\"%d\" vlen=\"%lu\">\n",
+        (unsigned long long)g_ps.target, g_ps.vtype, g_ps.vlen);
+    std::lock_guard<std::mutex> lk(g_psResMtx);
+    for (auto& p : g_psRes) {
+        char offs[128]{};
+        for (int k = 0; k < p.nOff; k++)
+            snprintf(offs + strlen(offs), sizeof(offs) - strlen(offs), "%s%llX", k ? "," : "", (unsigned long long)p.offs[k]);
+        fprintf(f, "<P mod=\"%s\" moff=\"%llX\" n=\"%d\" offs=\"%s\" points=\"%llX\"/>\n",
+            p.mod.c_str(), (unsigned long long)p.modOff, p.nOff, offs, (unsigned long long)p.pointsTo);
+    }
+    fprintf(f, "</LegendPointers>\n");
+    fclose(f);
+    char s[160]; snprintf(s, sizeof(s), "Pointerlist saved: %zu paths", g_psRes.size());
+    setStatus(s);
+}
+// Resolve one saved path against CURRENT module bases (rebase-safe rescan)
+static bool PS_ResolveByName(const std::string& mod, UINT64 modOff, const UINT64* offs, int n, UINT64& out) {
+    UINT64 base = 0;
+    for (auto& m : g_mods) {
+        if (_stricmp(m.name.c_str(), mod.c_str()) == 0 && m.size) { base = m.base + modOff; break; }
+    }
+    if (!base || !g_drv || !g_attached) return false;
+    UINT64 p = base;
+    for (int i = 0; i < n && i < PTR_MAX; i++) {
+        UINT64 v = 0;
+        g_drv->read_raw(p + offs[i], (BYTE*)&v, 8);
+        if (!v) return false;
+        p = v;
+    }
+    out = p;
+    return true;
+}
+static void PS_OpenOptions(UINT64 target, int vtype, ULONG vlen) {
+    if (!g_drv || !g_attached) { setStatus("Attach first"); return; }
+    if (g_pscanning) { setStatus("Pointer scan already running"); return; }
+    if (g_dlg) { SetForegroundWindow(g_dlg); return; }
+    g_ps.target = target; g_ps.vtype = vtype; g_ps.vlen = vlen;
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Pointerscanner scanoptions", WS_POPUP | WS_CAPTION | WS_SYSMENU, 300, 200, 380, 300, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    HWND p = g_dlg;
+    auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
+        HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
+        if (g_fUI) SendMessageA(h2, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+        return h2;
+    };
+    c("STATIC", "Scan for address", SS_LEFT, 12, 12, 120, 20, -1);
+    char ab[32]; snprintf(ab, sizeof(ab), "%llX", (unsigned long long)target);
+    c("EDIT", ab, WS_BORDER | ES_AUTOHSCROLL, 140, 10, 210, 24, PSO_ADDR);
+    c("STATIC", "Max different offsets per node:", SS_LEFT, 12, 44, 200, 20, -1);
+    c("EDIT", "3", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 220, 42, 60, 24, PSO_DIFF);
+    c("STATIC", "Nr of threads scanning:", SS_LEFT, 12, 74, 200, 20, -1);
+    c("EDIT", "4", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 220, 72, 60, 24, PSO_THR);
+    c("STATIC", "Maximum offset value:", SS_LEFT, 12, 104, 200, 20, -1);
+    c("EDIT", "4095", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 220, 102, 60, 24, PSO_MAXOFF);
+    c("STATIC", "Max level (1-5):", SS_LEFT, 12, 134, 200, 20, -1);
+    c("EDIT", "5", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 220, 132, 60, 24, PSO_LVL);
+    c("BUTTON", "OK", BS_DEFPUSHBUTTON, 90, 180, 90, 28, DLG_OK_BTN);
+    c("BUTTON", "Cancel", BS_PUSHBUTTON, 200, 180, 90, 28, DLG_CANCEL_BTN);
+    SetWindowLongPtrA(p, GWLP_USERDATA, 7); // mode 7 = pointerscan options
+    ShowWindow(p, SW_SHOW);
+}
+static void PS_OpenProgress() {
+    if (g_psProg) { SetForegroundWindow(g_psProg); return; }
+    g_psProg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsPSP, "Pointer scan", WS_POPUP | WS_CAPTION | WS_SYSMENU, 300, 200, 420, 250, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    HWND p = g_psProg;
+    auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
+        HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
+        if (g_fUI) SendMessageA(h2, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+        return h2;
+    };
+    c("STATIC", "Starting...", SS_LEFT, 12, 12, 380, 170, PS_PROG_STAT);
+    c("BUTTON", "Stop", BS_PUSHBUTTON, 150, 190, 100, 28, PS_STOP);
+    ShowWindow(p, SW_SHOW);
+}
+static void PS_UpdateProgress() {
+    if (!g_psProg) return;
+    DWORD el = (GetTickCount() - g_ps.startTick) / 1000;
+    char s[512];
+    snprintf(s, sizeof(s),
+        "Target: %llX\r\nLevel: %d / %d   Regions: %d / %d\r\nPaths evaluated: %llu\r\nResults found: %llu\r\nTime: %lus\r\n%s",
+        (unsigned long long)g_ps.target, (int)g_ps.level, g_ps.maxLevel,
+        (int)g_ps.regionsDone, (int)g_ps.regionsTotal,
+        (unsigned long long)g_ps.paths.load(), (unsigned long long)g_ps.results.load(), el,
+        g_ps.run ? "Scanning..." : "Finishing...");
+    SetDlgItemTextA(g_psProg, PS_PROG_STAT, s);
+}
+static void PS_RefreshResList() {
+    HWND lv = nullptr;
+    if (g_psWin) lv = GetDlgItem(g_psWin, PS_RES_LIST);
+    if (!lv) return;
+    SendMessageA(lv, LVM_DELETEALLITEMS, 0, 0);
+    std::lock_guard<std::mutex> lk(g_psResMtx);
+    LVITEMA it{}; it.mask = LVIF_TEXT;
+    char b[160], o[32], pt[48];
+    size_t show = (std::min<size_t>)(g_psRes.size(), 20000);
+    for (size_t i = 0; i < show; i++) {
+        auto& p = g_psRes[i];
+        snprintf(b, sizeof(b), "\"%s\"+%llX", p.mod.c_str(), (unsigned long long)p.modOff);
+        it.iItem = (int)i; it.iSubItem = 0; it.pszText = b;
+        SendMessageA(lv, LVM_INSERTITEMA, 0, (LPARAM)&it);
+        for (int k = 0; k < 5; k++) {
+            if (k < p.nOff) snprintf(o, sizeof(o), "%llX", (unsigned long long)p.offs[k]);
+            else snprintf(o, sizeof(o), "-");
+            lv_set_text(lv, (int)i, 1 + k, o);
+        }
+        snprintf(pt, sizeof(pt), "%llX", (unsigned long long)p.pointsTo);
+        lv_set_text(lv, (int)i, 6, pt);
+    }
+    char t[128]; snprintf(t, sizeof(t), "Pointer paths:%zu", g_psRes.size());
+    SetWindowTextA(g_psWin, t);
+}
+static void PS_OpenResults() {
+    if (g_psWin) { PS_RefreshResList(); SetForegroundWindow(g_psWin); return; }
+    g_psWin = CreateWindowExA(0, g_clsPSR, "Pointer paths:0", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_MAXIMIZEBOX,
+        120, 80, 900, 520, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    HWND p = g_psWin;
+    HWND lv = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        8, 8, 868, 400, p, (HMENU)(INT_PTR)PS_RES_LIST, GetModuleHandleA(nullptr), nullptr);
+    ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    {
+        const char* n[] = { "Base Address", "Offset 0", "Offset 1", "Offset 2", "Offset 3", "Offset 4", "Points to:" };
+        int w[] = { 220, 90, 90, 90, 90, 90, 150 };
+        lv_cols(lv, n, w, 7);
+    }
+    auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
+        HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
+        if (g_fUI) SendMessageA(h2, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+        return h2;
+    };
+    c("BUTTON", "Rescan...", BS_PUSHBUTTON, 8, 420, 110, 28, PS_RESCAN);
+    c("BUTTON", "Add Selected", BS_PUSHBUTTON, 128, 420, 110, 28, PS_ADD);
+    c("BUTTON", "Save", BS_PUSHBUTTON, 248, 420, 90, 28, PS_SAVE);
+    c("BUTTON", "Close", BS_PUSHBUTTON, 348, 420, 90, 28, PS_CLOSEB);
+    ShowWindow(p, SW_SHOW);
+    PS_RefreshResList();
+}
+static void PS_AddSelected() {
+    if (!g_psWin) return;
+    HWND lv = GetDlgItem(g_psWin, PS_RES_LIST);
+    int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+    if (sel < 0) { setStatus("Select a pointer path first"); return; }
+    PSPath p; bool got = false;
+    {
+        std::lock_guard<std::mutex> lk(g_psResMtx);
+        if ((size_t)sel < g_psRes.size()) { p = g_psRes[(size_t)sel]; got = true; }
+    }
+    if (!got) return;
+    TblEntry e{};
+    snprintf(e.desc, sizeof(e.desc), "Pointer");
+    snprintf(e.mod, sizeof(e.mod), "%s", p.mod.c_str());
+    e.modOff = p.modOff;
+    e.vtype = g_ps.vtype; e.len = g_ps.vlen ? g_ps.vlen : 4;
+    e.isPtr = true; e.nOff = p.nOff;
+    for (int i = 0; i < p.nOff && i < PTR_MAX; i++) e.ptrOffs[i] = p.offs[i];
+    UINT64 f = 0;
+    if (g_drv && g_attached && entry_final(e, f)) g_drv->read_raw(f, e.bytes, e.len);
+    {
+        std::lock_guard<std::mutex> lk(g_tableMtx);
+        g_table.push_back(e);
+    }
+    refresh_table();
+    char s[160]; snprintf(s, sizeof(s), "Added P->\"%s\"+%llX (%d offs)", p.mod.c_str(), (unsigned long long)p.modOff, p.nOff);
+    setStatus(s);
+}
+static void PS_OpenRescan() {
+    if (!g_attached) { setStatus("Attach first"); return; }
+    if (g_dlg) { SetForegroundWindow(g_dlg); return; }
+    char cur[32]; snprintf(cur, sizeof(cur), "%llX", (unsigned long long)g_ps.target);
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Rescan pointerlist", WS_POPUP | WS_CAPTION | WS_SYSMENU, 320, 220, 360, 170, g_psWin ? g_psWin : g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    HWND p = g_dlg;
+    auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
+        HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
+        if (g_fUI) SendMessageA(h2, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+        return h2;
+    };
+    c("STATIC", "Address to find:", SS_LEFT, 12, 14, 110, 20, -1);
+    c("EDIT", cur, WS_BORDER | ES_AUTOHSCROLL, 130, 12, 200, 24, PSR_ADDR);
+    c("BUTTON", "OK", BS_DEFPUSHBUTTON, 90, 60, 80, 28, DLG_OK_BTN);
+    c("BUTTON", "Cancel", BS_PUSHBUTTON, 190, 60, 80, 28, DLG_CANCEL_BTN);
+    SetWindowLongPtrA(p, GWLP_USERDATA, 8); // mode 8 = pointer rescan
+    ShowWindow(p, SW_SHOW);
+}
+static void PS_DoRescan(const std::string& txt) {
+    UINT64 newT = strtoull(txt.c_str(), nullptr, 16);
+    if (!newT) { setStatus("Bad address"); return; }
+    if (!g_attached || !g_drv) { setStatus("Attach first"); return; }
+    RefreshMods(g_pid); // current bases (post-restart ASLR)
+    std::vector<PSPath> kept;
+    {
+        std::lock_guard<std::mutex> lk(g_psResMtx);
+        for (auto& p : g_psRes) {
+            UINT64 f = 0;
+            if (PS_ResolveByName(p.mod, p.modOff, p.offs, p.nOff, f) && f == newT) {
+                p.pointsTo = newT;
+                kept.push_back(p);
+            }
+        }
+        g_psRes.swap(kept);
+    }
+    g_ps.target = newT;
+    PS_RefreshResList();
+    char s[160]; snprintf(s, sizeof(s), "Rescan: %zu paths still point to %llX", g_psRes.size(), (unsigned long long)newT);
+    setStatus(s);
+    // checkpoint again, like CE asks to save after rescan
+    char path[MAX_PATH]{};
+    if (TableFileDlg(true, path, MAX_PATH)) {
+        // force .lps extension flavor
+        PS_SaveList(path);
+    }
+}
+// Entry points (table row / found row)
+static void PS_ForTableRow() {
+    HWND lv = ctl(IDC_TBL_LIST);
+    int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+    if (sel < 0) {
+        // fall back to found list
+        HWND fl = ctl(IDC_FOUND_LIST);
+        sel = fl ? ListView_GetNextItem(fl, -1, LVNI_SELECTED) : -1;
+        if (sel < 0) { setStatus("Select a table or found row first"); return; }
+        PS_ForFoundRow();
+        return;
+    }
+    TblEntry e; bool got = false;
+    {
+        std::lock_guard<std::mutex> lk(g_tableMtx);
+        if ((size_t)sel < g_table.size()) { e = g_table[(size_t)sel]; got = true; }
+    }
+    if (!got) return;
+    UINT64 f = e.addr;
+    if (!g_drv || !g_attached || !entry_final(e, f)) { setStatus("Attach first"); return; }
+    PS_OpenOptions(f, e.vtype, e.len);
+}
+static void PS_ForFoundRow() {
+    HWND lv = ctl(IDC_FOUND_LIST);
+    int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+    if (sel < 0) { setStatus("Select a found row first"); return; }
+    UINT64 addr = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_candsMtx);
+        if ((size_t)sel >= g_cands.size()) return;
+        addr = g_cands[(size_t)sel].addr;
+    }
+    PS_OpenOptions(addr, g_vtype, g_valLen ? g_valLen : 4);
+}
+static LRESULT CALLBACK PSProgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_COMMAND && LOWORD(w) == PS_STOP) {
+        g_ps.stop = true;
+        SetDlgItemTextA(h, PS_STOP, "Stopping...");
+        EnableWindow(GetDlgItem(h, PS_STOP), FALSE);
+        return 0;
+    }
+    if (m == WM_CLOSE) {
+        if (g_ps.run) {
+            g_ps.stop = true;
+            return 0;
+        }
+        DestroyWindow(h);
+        return 0;
+    }
+    if (m == WM_DESTROY) { if (h == g_psProg) g_psProg = nullptr; return 0; }
+    return DefWindowProcA(h, m, w, l);
+}
+static LRESULT CALLBACK PSResProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_COMMAND) {
+        int id = LOWORD(w);
+        if (id == PS_CLOSEB) { DestroyWindow(h); return 0; }
+        if (id == PS_ADD) { PS_AddSelected(); return 0; }
+        if (id == PS_RESCAN) { PS_OpenRescan(); return 0; }
+        if (id == PS_SAVE) {
+            char path[MAX_PATH]{};
+            if (TableFileDlg(true, path, MAX_PATH)) PS_SaveList(path);
+            return 0;
+        }
+        return 0;
+    }
+    if (m == WM_NOTIFY) {
+        LPNMHDR nh = (LPNMHDR)l;
+        if (nh->idFrom == (UINT_PTR)PS_RES_LIST && nh->code == NM_DBLCLK) {
+            PS_AddSelected();
+            return 0;
+        }
+    }
+    if (m == WM_CLOSE) { DestroyWindow(h); return 0; }
+    if (m == WM_DESTROY) { if (h == g_psWin) g_psWin = nullptr; return 0; }
+    return DefWindowProcA(h, m, w, l);
+}
+
+//=================================================================
 //  WndProcs
 //=================================================================
 static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -1720,6 +2268,45 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 refresh_table();
                 setStatus(g_showModAddr ? "Module addresses ON" : "Module addresses OFF");
                 DestroyWindow(h);
+                return 0;
+            }
+            if (mode == 7) {
+                // Pointerscan options -> checkpoint save dialog -> scan
+                UINT64 t = strtoull(dlgText(h, PSO_ADDR).c_str(), nullptr, 16);
+                int diff = atoi(dlgText(h, PSO_DIFF).c_str());
+                int thr = atoi(dlgText(h, PSO_THR).c_str());
+                int moff = atoi(dlgText(h, PSO_MAXOFF).c_str());
+                int lvl = atoi(dlgText(h, PSO_LVL).c_str());
+                if (!t) { SetFocus(GetDlgItem(h, PSO_ADDR)); return 0; }
+                if (diff < 1) diff = 1; if (diff > 20) diff = 20;
+                if (thr < 1) thr = 1; if (thr > 16) thr = 16;
+                if (moff < 8) moff = 8; if (moff > 0x100000) moff = 0x100000;
+                if (lvl < 1) lvl = 1; if (lvl > PTR_MAX) lvl = PTR_MAX;
+                if (!g_drv || !g_attached) { setStatus("Attach first"); DestroyWindow(h); return 0; }
+                char path[MAX_PATH]{};
+                snprintf(path, sizeof(path), "pointers");
+                // ask where to store results (CE checkpoint), then scan
+                OPENFILENAMEA of{};
+                of.lStructSize = sizeof(of);
+                of.hwndOwner = h;
+                of.lpstrFilter = "Legend Pointerlist (*.lps)\0*.lps\0All files (*.*)\0*.*\0";
+                of.lpstrDefExt = "lps";
+                of.lpstrFile = path;
+                of.nMaxFile = MAX_PATH;
+                of.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+                if (!GetSaveFileNameA(&of)) return 0; // user cancelled: stay, no scan
+                UINT64 tt = t; int vt = g_ps.vtype; ULONG vl = g_ps.vlen;
+                std::string sp = path;
+                DestroyWindow(h);
+                RefreshMods(g_pid);
+                std::thread(PSScanThread, tt, vt, vl, lvl, moff, diff, thr, sp).detach();
+                return 0;
+            }
+            if (mode == 8) {
+                // Pointer rescan: filter to new target, then checkpoint-save again
+                std::string t = dlgText(h, PSR_ADDR);
+                DestroyWindow(h);
+                PS_DoRescan(t);
                 return 0;
             }
             if (mode == 5) {
@@ -1992,6 +2579,8 @@ static HMENU BuildMenu() {
     AppendMenuA(s, MF_STRING, 9004, "First Scan");
     AppendMenuA(s, MF_STRING, 9005, "Next Scan");
     AppendMenuA(s, MF_STRING, 9006, "Undo Scan");
+    AppendMenuA(s, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(s, MF_STRING, 9013, "Pointer Scan...");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)s, "Scan");
     HMENU v = CreatePopupMenu();
     AppendMenuA(v, MF_STRING, 9007, "Memory View");
@@ -2095,6 +2684,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else TableAct(sel, id == CTX_VAL ? 4 : id == CTX_TYPE ? 3 : id == CTX_DESC ? 1 : 2);
         }
         else if (id == CTX_ADD) doAddFoundToTableDirect();
+        else if (id == CTX_PS) { if (g_ctxFound) PS_ForFoundRow(); else PS_ForTableRow(); }
+        else if (id == 9013) PS_ForTableRow();
         else if (id == 9003) { if (!g_connected) std::thread(DriverThread).detach(); }
         else if (id == IDC_FIRST_BTN || id == 9004) start_first();
         else if (id == IDC_NEXT_BTN || id == 9005) start_next();
@@ -2199,6 +2790,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int hit = ListView_HitTest(child, &ht);
         if (hit >= 0) ListView_SetItemState(child, hit, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         HMENU m = CreatePopupMenu();
+        g_ctxFound = isFound;
         if (isTbl) {
             AppendMenuA(m, MF_STRING, CTX_DEL, "Delete This Address");
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
@@ -2206,9 +2798,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AppendMenuA(m, MF_STRING, CTX_TYPE, "Change Type");
             AppendMenuA(m, MF_STRING, CTX_DESC, "Change Description");
             AppendMenuA(m, MF_STRING, CTX_ADDR, "Change Address...");
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(m, MF_STRING, CTX_PS, "Pointer Scan for This Address");
         }
         else {
             AppendMenuA(m, MF_STRING, CTX_ADD, "Add to Address List");
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(m, MF_STRING, CTX_PS, "Pointer Scan for This Address");
         }
         TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON, px, py, 0, g_hwnd, nullptr);
         DestroyMenu(m);
@@ -2217,10 +2813,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 7) {
             if (g_drv && g_attached && !g_table.empty()) refresh_table_live();
+            if (g_psProg) PS_UpdateProgress();
         }
         return 0;
     case WM_SCAN_DONE: {
         if (wp == 1) { refresh_found(); refresh_table(); setStatus(g_scanMsg); }
+        else if (wp == 3) { PS_OpenProgress(); setStatus("Pointer scan running..."); }
+        else if (wp == 4) {
+            if (g_psProg) { DestroyWindow(g_psProg); g_psProg = nullptr; }
+            PS_OpenResults();
+            size_t n = 0;
+            { std::lock_guard<std::mutex> lk(g_psResMtx); n = g_psRes.size(); }
+            char s[160]; snprintf(s, sizeof(s), "Pointer scan done: %zu paths", n);
+            setStatus(s);
+        }
         else setStatus(g_scanMsg);
         return 0;
     }
@@ -2247,6 +2853,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     GenRandomStr(g_clsMain, sizeof(g_clsMain));
     GenRandomStr(g_clsDlg, sizeof(g_clsDlg));
     GenRandomStr(g_clsMem, sizeof(g_clsMem));
+    GenRandomStr(g_clsPSP, sizeof(g_clsPSP));
+    GenRandomStr(g_clsPSR, sizeof(g_clsPSR));
 
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
@@ -2273,6 +2881,22 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     v.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     v.lpszClassName = g_clsMem;
     RegisterClassExA(&v);
+    WNDCLASSEXA pp{};
+    pp.cbSize = sizeof(pp);
+    pp.lpfnWndProc = PSProgProc;
+    pp.hInstance = hInst;
+    pp.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    pp.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    pp.lpszClassName = g_clsPSP;
+    RegisterClassExA(&pp);
+    WNDCLASSEXA pr{};
+    pr.cbSize = sizeof(pr);
+    pr.lpfnWndProc = PSResProc;
+    pr.hInstance = hInst;
+    pr.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    pr.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    pr.lpszClassName = g_clsPSR;
+    RegisterClassExA(&pr);
     HWND w = CreateWindowExA(0, g_clsMain, "Chrome",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         80, 40, 800, 700, nullptr, nullptr, hInst, nullptr);
