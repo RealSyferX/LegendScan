@@ -13,6 +13,7 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <intrin.h> // __readgsqword for PEB masquerade
 #include <string>
 #include <vector>
 #include <thread>
@@ -48,6 +49,137 @@ static void HideThreadFromDebugger() {
     auto fn = (Fn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationThread");
     if (fn) fn(GetCurrentThread(), 0x11, nullptr, 0);
 }
+
+//=================================================================
+//  USERMODE STEALTH (ported from DesAnime) — PEB masquerade as Chrome,
+//  fake Chrome IPC mutex, VERSION_INFO patch, DbgBreakPoint patch,
+//  random window classes + spoofed captions.
+//  If BE bans based on this, they'd be banning Chrome worldwide.
+//=================================================================
+static void PatchDbgBreakPoint() {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    PVOID bp = GetProcAddress(ntdll, "DbgBreakPoint");
+    if (!bp) return;
+    DWORD old;
+    VirtualProtect(bp, 1, PAGE_EXECUTE_READWRITE, &old);
+    *(BYTE*)bp = 0xC3;
+    VirtualProtect(bp, 1, old, &old);
+}
+
+static void GenRandomStr(char* out, int len) {
+    const char* c = "abcdefghijklmnopqrstuvwxyz0123456789";
+    for (int i = 0; i < len - 1; i++) out[i] = c[rand() % 36];
+    out[len - 1] = '\0';
+}
+
+static void SpoofWindowTitle(HWND hwnd) {
+    const char* names[] = {
+        "NVIDIA GeForce Experience", "Discord",
+        "Windows Security", "Microsoft Edge", "System Settings"
+    };
+    SetWindowTextA(hwnd, names[rand() % 5]);
+}
+
+// Spoof PEB ImagePathName and CommandLine to look like Chrome
+static void SpoofPEB() {
+    typedef struct _UNICODE_STR {
+        USHORT Length;
+        USHORT MaximumLength;
+        PWSTR Buffer;
+    } UNICODE_STR;
+
+    typedef struct _RTL_USER_PROCESS_PARAMETERS {
+        BYTE Reserved1[16];
+        PVOID Reserved2[10];
+        UNICODE_STR ImagePathName;
+        UNICODE_STR CommandLine;
+    } RTL_USER_PROC_PARAMS;
+
+    PVOID peb = nullptr;
+#ifdef _WIN64
+    peb = (PVOID)__readgsqword(0x60);
+#else
+    peb = (PVOID)__readfsdword(0x30);
+#endif
+    if (!peb) return;
+
+#ifdef _WIN64
+    auto params = *(RTL_USER_PROC_PARAMS**)((BYTE*)peb + 0x20);
+#else
+    auto params = *(RTL_USER_PROC_PARAMS**)((BYTE*)peb + 0x10);
+#endif
+    if (!params) return;
+
+    wchar_t fakePath[MAX_PATH] = {};
+    wchar_t localAppData[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH)) {
+        wsprintfW(fakePath, L"%s\\Google\\Chrome\\Application\\chrome.exe", localAppData);
+    }
+    else {
+        wcscpy_s(fakePath, L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe");
+    }
+
+    wchar_t fakeCmdLine[512] = {};
+    wsprintfW(fakeCmdLine, L"\"%s\" --type=utility --utility-sub-type=network.mojom.NetworkService", fakePath);
+
+    size_t pathLen = wcslen(fakePath) * sizeof(wchar_t);
+    if (params->ImagePathName.MaximumLength >= (USHORT)(pathLen + 2)) {
+        RtlZeroMemory(params->ImagePathName.Buffer, params->ImagePathName.MaximumLength);
+        memcpy(params->ImagePathName.Buffer, fakePath, pathLen);
+        params->ImagePathName.Length = (USHORT)pathLen;
+    }
+
+    size_t cmdLen = wcslen(fakeCmdLine) * sizeof(wchar_t);
+    if (params->CommandLine.MaximumLength >= (USHORT)(cmdLen + 2)) {
+        RtlZeroMemory(params->CommandLine.Buffer, params->CommandLine.MaximumLength);
+        memcpy(params->CommandLine.Buffer, fakeCmdLine, cmdLen);
+        params->CommandLine.Length = (USHORT)cmdLen;
+    }
+}
+
+// Fake Chrome named objects — anti-cheat mutex scans see Chrome artifacts
+static HANDLE g_fakeMutex = nullptr;
+static void CreateChromeMutexes() {
+    g_fakeMutex = CreateMutexW(nullptr, FALSE, L"GoogleChromeIPCMutex");
+}
+
+// Spoof the main module's PE version info in memory ("LegendScan" -> "Google Chrome")
+static void SpoofModuleDescription() {
+    HMODULE hMod = GetModuleHandleA(nullptr);
+    if (!hMod) return;
+
+    HRSRC hRes = FindResourceA(hMod, MAKEINTRESOURCEA(1), MAKEINTRESOURCEA(16)); // RT_VERSION = 16
+    if (!hRes) return;
+
+    HGLOBAL hGlobal = LoadResource(hMod, hRes);
+    if (!hGlobal) return;
+
+    PVOID pVer = LockResource(hGlobal);
+    DWORD szVer = SizeofResource(hMod, hRes);
+    if (!pVer || !szVer) return;
+
+    DWORD oldProt;
+    VirtualProtect(pVer, szVer, PAGE_READWRITE, &oldProt);
+
+    const wchar_t* needles[] = { L"LegendScan", L"Scanner", L"amdfend" };
+    const wchar_t* replacement = L"Google Chrome  ";
+
+    for (DWORD off = 0; off + 32 < szVer; off += 2) {
+        wchar_t* scan = (wchar_t*)((BYTE*)pVer + off);
+        for (auto needle : needles) {
+            size_t nLen = wcslen(needle);
+            if (wcsncmp(scan, needle, nLen) == 0) {
+                size_t rLen = wcslen(replacement);
+                size_t copyLen = (std::min)(rLen, nLen + 4);
+                memcpy(scan, replacement, copyLen * sizeof(wchar_t));
+            }
+        }
+    }
+
+    VirtualProtect(pVer, szVer, oldProt, &oldProt);
+}
+
+static char g_clsMain[16]{}, g_clsDlg[16]{}, g_clsMem[16]{};
 
 //=================================================================
 //  Globals
@@ -1043,7 +1175,7 @@ static void layoutManualDlg(HWND h) {
 static void OpenManualAdd(const char* addrPref, int vtypePref, bool isPtrPref = false, const UINT64* offsPref = nullptr, int nOffPref = 0, bool signedPref = false, const char* descPref = nullptr, const char* titlePref = nullptr) {
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
     g_dlgNOff = (isPtrPref && nOffPref > 0) ? (std::min)(nOffPref, PTR_MAX) : 1;
-    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "LSManualCls", titlePref ? titlePref : "Add address", WS_POPUP | WS_CAPTION | WS_SYSMENU, 300, 200, 300, 300, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, titlePref ? titlePref : "Add address", WS_POPUP | WS_CAPTION | WS_SYSMENU, 300, 200, 300, 300, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_dlg;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
         HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
@@ -1090,7 +1222,7 @@ static void OpenManualAdd(const char* addrPref, int vtypePref, bool isPtrPref = 
 // --- Settings popup (mode 6) ---
 static void OpenSettings() {
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
-    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "LSManualCls", "Settings", WS_POPUP | WS_CAPTION | WS_SYSMENU, 350, 250, 340, 150, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Settings", WS_POPUP | WS_CAPTION | WS_SYSMENU, 350, 250, 340, 150, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_dlg;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
         HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
@@ -1107,7 +1239,7 @@ static void OpenSettings() {
 // --- CE column popups (modes 3/4/5) ---
 static void OpenChangeValue(const TblEntry& e) {
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
-    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "LSManualCls", "Change Value", WS_POPUP | WS_CAPTION | WS_SYSMENU, 350, 250, 330, 150, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Change Value", WS_POPUP | WS_CAPTION | WS_SYSMENU, 350, 250, 330, 150, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_dlg;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
         HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
@@ -1131,7 +1263,7 @@ static void OpenChangeValue(const TblEntry& e) {
 }
 static void OpenChangeType(const TblEntry& e) {
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
-    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "LSManualCls", "Type", WS_POPUP | WS_CAPTION | WS_SYSMENU, 350, 250, 300, 200, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Type", WS_POPUP | WS_CAPTION | WS_SYSMENU, 350, 250, 300, 200, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_dlg;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
         HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
@@ -1156,7 +1288,7 @@ static void OpenChangeType(const TblEntry& e) {
 }
 static void OpenChangeDesc(const TblEntry& e) {
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
-    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "LSManualCls", "Change Description", WS_POPUP | WS_CAPTION | WS_SYSMENU, 350, 250, 360, 140, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Change Description", WS_POPUP | WS_CAPTION | WS_SYSMENU, 350, 250, 360, 140, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_dlg;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
         HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
@@ -1176,7 +1308,7 @@ static void OpenChangeDesc(const TblEntry& e) {
 // Memory viewer popup
 static void OpenMemView() {
     if (g_mv) { SetForegroundWindow(g_mv); return; }
-    g_mv = CreateWindowExA(WS_EX_DLGMODALFRAME, "LSMemCls", "LegendScan - Memory Viewer", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, 200, 150, 640, 480, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_mv = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsMem, "System Settings", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, 200, 150, 640, 480, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_mv;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
         HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
@@ -1328,8 +1460,7 @@ static void doAttachStr(const std::string& input) {
     RefreshMods(pid);
     char lbl[200]; snprintf(lbl, sizeof(lbl), "%s  (PID %lu)  [drv %08X]", pname, pid, v);
     SetWindowTextA(ctl(IDC_PROC_LBL), lbl);
-    char ttl[200]; snprintf(ttl, sizeof(ttl), "LegendScan - %lX-%s (amdfend)", pid, pname);
-    SetWindowTextA(g_hwnd, ttl);
+    // NOTE: window caption stays spoofed (Chrome cover) — target info lives in PROC_LBL
     char st[160]; snprintf(st, sizeof(st), "Attached PID %lu", pid);
     setStatus(st);
 }
@@ -1386,7 +1517,7 @@ static void ProcOkFromDialog(HWND h) {
 }
 static void OpenProcDialog() {
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
-    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "LSManualCls", "Process List", WS_POPUP | WS_CAPTION | WS_SYSMENU, 250, 150, 420, 480, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Process List", WS_POPUP | WS_CAPTION | WS_SYSMENU, 250, 150, 420, 480, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_dlg;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
         HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
@@ -1919,6 +2050,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         g_hwnd = hwnd;
+        SpoofWindowTitle(hwnd); // innocuous caption; target info lives in PROC_LBL
         g_fUI = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, "Segoe UI");
         SetMenu(hwnd, BuildMenu());
         {
@@ -1944,7 +2076,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_cands.clear(); g_undo.clear();
             }
             refresh_found(); refresh_table();
-            SetWindowTextA(g_hwnd, "LegendScan - Kernel CE (amdfend)");
+            SpoofWindowTitle(g_hwnd); // re-roll cover caption
             setStatus("New table");
         }
         else if (id == 9010) {
@@ -2105,6 +2237,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     srand((unsigned)time(nullptr));
     HideThreadFromDebugger();
+    PatchDbgBreakPoint();
+
+    // Process masquerade — must run before window creation
+    SpoofPEB();                // PEB ImagePath + CmdLine -> Chrome
+    CreateChromeMutexes();     // Fake Chrome IPC mutex
+    SpoofModuleDescription();  // Patch VERSION_INFO in memory
+
+    GenRandomStr(g_clsMain, sizeof(g_clsMain));
+    GenRandomStr(g_clsDlg, sizeof(g_clsDlg));
+    GenRandomStr(g_clsMem, sizeof(g_clsMem));
+
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -2112,7 +2255,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = "LegendScanCls";
+    wc.lpszClassName = g_clsMain;
     RegisterClassExA(&wc);
     WNDCLASSEXA m{};
     m.cbSize = sizeof(m);
@@ -2120,7 +2263,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     m.hInstance = hInst;
     m.hCursor = LoadCursor(nullptr, IDC_ARROW);
     m.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    m.lpszClassName = "LSManualCls";
+    m.lpszClassName = g_clsDlg;
     RegisterClassExA(&m);
     WNDCLASSEXA v{};
     v.cbSize = sizeof(v);
@@ -2128,9 +2271,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     v.hInstance = hInst;
     v.hCursor = LoadCursor(nullptr, IDC_ARROW);
     v.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    v.lpszClassName = "LSMemCls";
+    v.lpszClassName = g_clsMem;
     RegisterClassExA(&v);
-    HWND w = CreateWindowExA(0, "LegendScanCls", "LegendScan - Kernel CE (amdfend)",
+    HWND w = CreateWindowExA(0, g_clsMain, "Chrome",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         80, 40, 800, 700, nullptr, nullptr, hInst, nullptr);
     ShowWindow(w, SW_SHOW);

@@ -16,8 +16,11 @@
 ### Top bar
 - **PC button / Process menu** — opens the Process List: sorted
   `Process | PID` rows, **Refresh**, manual `Name or PID` box.
-  Double-click a row (or OK) to attach. Title bar becomes
-  `LegendScan - PID-proc (amdfend)`.
+  Double-click a row (or OK) to attach. Target shows in the PC label
+  (`name (PID) [drv …]`); the window caption stays a Chrome-cover title.
+- **Masquerade** (DesAnime-grade) — PEB ImagePath/CommandLine spoofed to
+  Chrome, fake `GoogleChromeIPCMutex`, Chrome `VERSIONINFO` (+ runtime
+  patch), `DbgBreakPoint` patched, hidden threads, random window classes.
 - **Found:n** — current candidate count (`(capped)` at 500 000).
 
 ### Found list — Address | Value | Previous

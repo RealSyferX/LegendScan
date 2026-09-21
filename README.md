@@ -42,6 +42,8 @@ from usermode. Kernel-side AOB/value scan = DMA-style speed without hardware.
 - **Memory Viewer** — hex dump + WriteBytes, separate window like CE
 - **Legend Table (.ltb)** — File → New / Open / Save; tiny XML storing
   active, desc, addr/module, type, signed/hex, pointer chain and bytes
+- **Masquerade** — PEB-as-Chrome, fake Chrome mutex + version info,
+  patched `DbgBreakPoint`, random window classes/cover captions
 - **Writes that land** — driver `MdlWrite` fallback handles `PAGE_READONLY`
   pages `MmCopyVirtualMemory` refuses; every write is read-back verified
 
