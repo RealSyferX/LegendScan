@@ -105,6 +105,9 @@ struct TblEntry {
 #define PTR_MAX 5
 static int g_editRow = -1; // table row targeted by Change Value/Type/Desc popups
 static bool g_editReplace = false; // true = Address dialog edits row in place (Cancel keeps it)
+static bool g_showModAddr = true; // Settings: show "mod"+OFF when possible (green = static)
+static std::vector<char> g_foundStatic; // per-row static flags for green font (found list)
+static std::vector<char> g_tblStatic;   // per-row static flags for green font (table)
 static std::vector<TblEntry> g_table;
 static std::mutex g_tableMtx;
 static std::atomic<bool> g_tblRefresh{ false }; // guard: ignore LVN_ITEMCHANGED while we rebuild
@@ -131,6 +134,8 @@ enum {
     PL_LIST = 1010, PL_REFRESH, PL_EDIT,
     // table/found context menu
     CTX_DEL = 9110, CTX_VAL, CTX_TYPE, CTX_DESC, CTX_ADDR, CTX_ADD,
+    // settings dialog
+    SET_MODCHK = 1040,
     // mem viewer popup
     MV_X = 1100, MV_ADDR_EDIT, MV_SIZE_EDIT, MV_DUMP_BTN, MV_WRITE_EDIT, MV_WRITE_BTN, MV_HEX_EDIT
 };
@@ -382,6 +387,21 @@ static void RefreshMods(DWORD pid) {
         SendMessageA(cb, CB_SETCURSEL, 0, 0);
     }
 }
+// Module-form display for any address: "mod"+OFF when inside a known module.
+// Returns true = static (green font), false = plain hex.
+static bool addr_display(UINT64 addr, char* buf, size_t n) {
+    if (g_showModAddr) {
+        for (auto& m : g_mods) {
+            if (!m.size) continue;
+            if (addr >= m.base && addr < m.base + m.size) {
+                snprintf(buf, n, "\"%s\"+%llX", m.name.c_str(), (unsigned long long)(addr - m.base));
+                return true;
+            }
+        }
+    }
+    snprintf(buf, n, "%016llX", (unsigned long long)addr);
+    return false;
+}
 
 //=================================================================
 //  ListView helpers (found list + table)
@@ -404,12 +424,13 @@ static void refresh_found() {
     ListView_DeleteAllItems(lv);
     std::lock_guard<std::mutex> lk(g_candsMtx);
     LVITEMA it{}; it.mask = LVIF_TEXT;
-    char a[32], v[128], pv[128];
+    char a[128], v[128], pv[128];
+    g_foundStatic.clear();
     size_t show = (std::min<size_t>)(g_cands.size(), 20000);
     for (size_t i = 0; i < show; i++) {
         BYTE cur[32]{};
         if (g_drv && g_attached) g_drv->read_raw(g_cands[i].addr, cur, g_valLen);
-        snprintf(a, sizeof(a), "%016llX", (unsigned long long)g_cands[i].addr);
+        g_foundStatic.push_back(addr_display(g_cands[i].addr, a, sizeof(a)) ? 1 : 0);
         std::string vs = fmt_val(g_vtype, cur, g_valLen, g_hexMode);
         std::string ps = fmt_val(g_vtype, g_cands[i].prev, g_valLen, g_hexMode);
         snprintf(v, sizeof(v), "%s", vs.c_str());
@@ -430,7 +451,8 @@ static void refresh_table() {
     std::lock_guard<std::mutex> lk(g_tableMtx);
     LVITEMA it{}; it.mask = LVIF_TEXT | LVIF_STATE;
     it.stateMask = LVIS_STATEIMAGEMASK;
-    char a[128], v[128];
+    char a[160], v[128];
+    g_tblStatic.clear();
     for (size_t i = 0; i < g_table.size(); i++) {
         auto& e = g_table[i];
         BYTE cur[32]{};
@@ -441,9 +463,19 @@ static void refresh_table() {
             have = true;
         }
         if (!have) memcpy(cur, e.bytes, e.len);
-        char bs[96]; entry_base_str(e, bs, sizeof(bs));
-        if (e.isPtr) snprintf(a, sizeof(a), "P->%s", bs);
-        else snprintf(a, sizeof(a), "%s", bs);
+        bool st = false;
+        if (e.mod[0]) {
+            char bs[128]; entry_base_str(e, bs, sizeof(bs));
+            if (e.isPtr) snprintf(a, sizeof(a), "P->%s", bs);
+            else snprintf(a, sizeof(a), "%s", bs);
+            st = true; // module-anchored = static
+        }
+        else if (e.isPtr) {
+            char bb[128]; st = addr_display(e.addr, bb, sizeof(bb));
+            snprintf(a, sizeof(a), "P->%s", bb);
+        }
+        else st = addr_display(e.addr, a, sizeof(a));
+        g_tblStatic.push_back(st ? 1 : 0);
         std::string vs = have ? fmt_valx(e.vtype, cur, e.len, e.hexDisp, e.isSigned) : std::string("??");
         snprintf(v, sizeof(v), "%s", vs.c_str());
         it.iItem = (int)i; it.iSubItem = 0; it.pszText = (LPSTR)"";
@@ -466,7 +498,8 @@ static void refresh_table_live() {
         n = g_table.size();
     }
     if (ListView_GetItemCount(lv) != (int)n) { refresh_table(); return; } // rows added/removed: rebuild
-    char a[128], v[128];
+    if (g_tblStatic.size() != n) g_tblStatic.assign(n, 0);
+    char a[160], v[128];
     for (size_t i = 0; i < n; i++) {
         TblEntry e;
         {
@@ -481,9 +514,19 @@ static void refresh_table_live() {
             have = true;
         }
         if (!have) memcpy(cur, e.bytes, e.len);
-        char bs[96]; entry_base_str(e, bs, sizeof(bs));
-        if (e.isPtr) snprintf(a, sizeof(a), "P->%s", bs);
-        else snprintf(a, sizeof(a), "%s", bs);
+        bool st = false;
+        if (e.mod[0]) {
+            char bs[128]; entry_base_str(e, bs, sizeof(bs));
+            if (e.isPtr) snprintf(a, sizeof(a), "P->%s", bs);
+            else snprintf(a, sizeof(a), "%s", bs);
+            st = true;
+        }
+        else if (e.isPtr) {
+            char bb[128]; st = addr_display(e.addr, bb, sizeof(bb));
+            snprintf(a, sizeof(a), "P->%s", bb);
+        }
+        else st = addr_display(e.addr, a, sizeof(a));
+        g_tblStatic[i] = st ? 1 : 0;
         std::string vs = have ? fmt_valx(e.vtype, cur, e.len, e.hexDisp, e.isSigned) : std::string("??");
         snprintf(v, sizeof(v), "%s", vs.c_str());
         lv_set_text(lv, (int)i, 2, a);
@@ -1044,6 +1087,23 @@ static void OpenManualAdd(const char* addrPref, int vtypePref, bool isPtrPref = 
     ShowWindow(p, SW_SHOW);
     updateManualPreview(p);
 }
+// --- Settings popup (mode 6) ---
+static void OpenSettings() {
+    if (g_dlg) { SetForegroundWindow(g_dlg); return; }
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "LSManualCls", "Settings", WS_POPUP | WS_CAPTION | WS_SYSMENU, 350, 250, 340, 150, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    HWND p = g_dlg;
+    auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
+        HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
+        if (g_fUI) SendMessageA(h2, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+        return h2;
+    };
+    HWND chk = c("BUTTON", "Show Module+Address (When Possible)", BS_AUTOCHECKBOX, 12, 16, 300, 22, SET_MODCHK);
+    if (g_showModAddr) SendMessageA(chk, BM_SETCHECK, BST_CHECKED, 0);
+    c("BUTTON", "OK", BS_DEFPUSHBUTTON, 70, 60, 80, 28, DLG_OK_BTN);
+    c("BUTTON", "Cancel", BS_PUSHBUTTON, 170, 60, 80, 28, DLG_CANCEL_BTN);
+    SetWindowLongPtrA(p, GWLP_USERDATA, 6); // mode 6 = settings
+    ShowWindow(p, SW_SHOW);
+}
 // --- CE column popups (modes 3/4/5) ---
 static void OpenChangeValue(const TblEntry& e) {
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
@@ -1521,6 +1581,16 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 DestroyWindow(h);
                 return 0;
             }
+            if (mode == 6) {
+                // Settings popup
+                g_showModAddr = SendMessageA(GetDlgItem(h, SET_MODCHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
+                g_editRow = -1;
+                refresh_found();
+                refresh_table();
+                setStatus(g_showModAddr ? "Module addresses ON" : "Module addresses OFF");
+                DestroyWindow(h);
+                return 0;
+            }
             if (mode == 5) {
                 // Change Description popup
                 std::string d = dlgText(h, DLG_DESC_EDIT);
@@ -1795,6 +1865,7 @@ static HMENU BuildMenu() {
     HMENU v = CreatePopupMenu();
     AppendMenuA(v, MF_STRING, 9007, "Memory View");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)v, "View");
+    AppendMenuA(bar, MF_STRING, 9012, "Settings");
     HMENU h = CreatePopupMenu();
     AppendMenuA(h, MF_STRING, 9008, "About");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)h, "Help");
@@ -1901,6 +1972,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else setStatus("Nothing to undo");
         }
         else if (id == IDC_MEMVIEW_BTN || id == 9007) OpenMemView();
+        else if (id == 9012) OpenSettings();
         else if (id == IDC_ADDADDR_BTN) doAddSelectedToTable();
         else if (id == IDC_VTYPE_CB && code == CBN_SELCHANGE) {
             // code patterns live in executable pages — assist like CE power users do
@@ -1924,6 +1996,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_NOTIFY: {
         LPNMHDR nh = (LPNMHDR)lp;
+        if (nh->code == NM_CUSTOMDRAW &&
+            (nh->idFrom == (UINT_PTR)IDC_FOUND_LIST || nh->idFrom == (UINT_PTR)IDC_TBL_LIST)) {
+            // green font for static (module-anchored) addresses, default otherwise
+            LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lp;
+            if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
+            if (cd->nmcd.dwDrawStage == (CDDS_SUBITEM | CDDS_ITEMPREPAINT)) {
+                if (cd->iSubItem == 0 || (nh->idFrom == (UINT_PTR)IDC_TBL_LIST && cd->iSubItem == 2)) {
+                    bool st = false;
+                    int row = (int)cd->nmcd.dwItemSpec;
+                    if (nh->idFrom == (UINT_PTR)IDC_FOUND_LIST) {
+                        std::lock_guard<std::mutex> lk(g_candsMtx);
+                        if (row >= 0 && (size_t)row < g_foundStatic.size()) st = g_foundStatic[(size_t)row] != 0;
+                    }
+                    else {
+                        std::lock_guard<std::mutex> lk(g_tableMtx);
+                        if (row >= 0 && (size_t)row < g_tblStatic.size()) st = g_tblStatic[(size_t)row] != 0;
+                    }
+                    if (st) { cd->clrText = RGB(0, 128, 0); return CDRF_NEWFONT; }
+                }
+            }
+            return CDRF_DODEFAULT;
+        }
         if (nh->idFrom == (UINT_PTR)IDC_FOUND_LIST && nh->code == NM_DBLCLK) {
             doAddFoundToTableDirect();
             return 0;
