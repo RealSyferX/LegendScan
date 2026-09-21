@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <winioctl.h>
 #include <iostream>
+#include <string>
 #include <vector>
 #include <cstdint>
 
@@ -16,7 +17,20 @@ constexpr DWORD ls_free_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C6, METHOD_B
 constexpr DWORD ls_version_code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C7, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr DWORD ls_scan_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C8, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr DWORD ls_query_code   = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C9, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
-constexpr DWORD LS_BUILD_TAG    = 0x00080002;
+constexpr DWORD ls_mods_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CA, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+constexpr DWORD LS_BUILD_TAG    = 0x00080003;
+
+#define LS_MODS_MAX 128
+struct ls_kmod_t {
+    PVOID base = nullptr;
+    ULONG size = 0;
+    WCHAR name[64]{};
+};
+struct ls_mods_req_t {
+    ULONG      count = 0;
+    ULONG      max = LS_MODS_MAX;
+    ls_kmod_t  mods[LS_MODS_MAX]{};
+};
 
 struct ls_info_t {
     UINT64 target_pid = 0;
@@ -186,6 +200,27 @@ public:
             cur = nxt;
         }
         return v;
+    }
+    struct KMod { std::string name; UINT64 base = 0; UINT64 size = 0; };
+    // Kernel module list — works on protected games where Toolhelp is stripped
+    std::vector<KMod> kernel_modules() {
+        std::vector<KMod> out;
+        ls_mods_req_t r{};
+        r.max = LS_MODS_MAX;
+        DWORD br = 0;
+        if (!DeviceIoControl(m_h, ls_mods_code, &r, sizeof(r), &r, sizeof(r), &br, nullptr)) return out;
+        char eb[128]{};
+        for (ULONG i = 0; i < r.count && i < LS_MODS_MAX; i++) {
+            if (!r.mods[i].base) continue;
+            WideCharToMultiByte(CP_ACP, 0, r.mods[i].name, -1, eb, (int)sizeof(eb), nullptr, nullptr);
+            if (!eb[0]) continue;
+            KMod m;
+            m.name = eb;
+            m.base = (UINT64)r.mods[i].base;
+            m.size = r.mods[i].size;
+            out.push_back(m);
+        }
+        return out;
     }
     PVOID alloc(UINT64 hint, UINT64 sz) {
         ls_info_t io{};

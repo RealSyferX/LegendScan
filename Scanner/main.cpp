@@ -349,6 +349,7 @@ struct ModInfo { std::string name; UINT64 base = 0; UINT64 size = 0; };
 static std::vector<ModInfo> g_mods;
 static DWORD g_modsPid = 0;
 // Refresh module list for scan-scope combo (All + exe/dll). Keeps selection when same PID.
+// Toolhelp first; on protected games (stripped handles) fall back to kernel PEB walk.
 static void RefreshMods(DWORD pid) {
     if (pid == g_modsPid && !g_mods.empty()) return;
     g_mods.clear(); g_modsPid = pid;
@@ -361,6 +362,11 @@ static void RefreshMods(DWORD pid) {
             g_mods.push_back({ eb, (UINT64)me.modBaseAddr, (UINT64)me.modBaseSize });
         } while (Module32NextW(snap, &me));
         CloseHandle(snap);
+    }
+    if (g_mods.empty() && g_drv && g_attached) {
+        // BattlEye & co strip usermode query handles — ask the driver instead
+        auto km = g_drv->kernel_modules();
+        for (auto& m : km) g_mods.push_back({ m.name, m.base, m.size });
     }
     std::sort(g_mods.begin(), g_mods.end(), [](const ModInfo& a, const ModInfo& b) {
         std::string al = a.name, bl = b.name;
@@ -635,7 +641,13 @@ static void FirstScanThread(std::string s1, std::string s2, int vtype, int stype
 
     push_undo();
     { std::lock_guard<std::mutex> lk(g_candsMtx); g_cands.swap(out); }
-    if (ok) snprintf(g_scanMsg, sizeof(g_scanMsg), "First scan done: %zu regions", scanned);
+    if (ok) {
+        if (scanned == 0)
+            snprintf(g_scanMsg, sizeof(g_scanMsg), "0 regions pass filters (tick Executable for code/AOB)");
+        else if (out.empty() && vtype == V_AOB && !o.executable)
+            snprintf(g_scanMsg, sizeof(g_scanMsg), "%zu regions, 0 hits - code lives in exec pages: tick Executable", scanned);
+        else snprintf(g_scanMsg, sizeof(g_scanMsg), "First scan done: %zu regions", scanned);
+    }
     else snprintf(g_scanMsg, sizeof(g_scanMsg), "Scan failed");
     PostMessageA(g_hwnd, WM_SCAN_DONE, 1, 0);
     g_scanning = false;
@@ -1890,6 +1902,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         else if (id == IDC_MEMVIEW_BTN || id == 9007) OpenMemView();
         else if (id == IDC_ADDADDR_BTN) doAddSelectedToTable();
+        else if (id == IDC_VTYPE_CB && code == CBN_SELCHANGE) {
+            // code patterns live in executable pages — assist like CE power users do
+            int vt = (int)SendMessageA(ctl(IDC_VTYPE_CB), CB_GETCURSEL, 0, 0);
+            if (vt == V_AOB) SendMessageA(ctl(IDC_EXEC_CHK), BM_SETCHECK, BST_CHECKED, 0);
+        }
         else if (id == IDC_PRESET_CB && code == CBN_SELCHANGE) {
             // CE behavior: picking a module fills Start/Stop with its range
             int sel = (int)SendMessageA(ctl(IDC_PRESET_CB), CB_GETCURSEL, 0, 0);
@@ -1902,7 +1919,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowTextA(ctl(IDC_START_EDIT), a);
             SetWindowTextA(ctl(IDC_STOP_EDIT), b);
         }
-        else if (id == 9008) MessageBoxA(hwnd, "LegendScan — kernel CE clone\nDriver: amdfend.sys (AMD_CrashDefend)\nBuild tag 00080002", "About", MB_OK);
+        else if (id == 9008) MessageBoxA(hwnd, "LegendScan — kernel CE clone\nDriver: amdfend.sys (AMD_CrashDefend)\nBuild tag 00080003", "About", MB_OK);
         return 0;
     }
     case WM_NOTIFY: {

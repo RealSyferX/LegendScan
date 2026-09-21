@@ -19,7 +19,8 @@ constexpr ULONG ls_free_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C6, METHOD_B
 constexpr ULONG ls_version_code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C7, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr ULONG ls_scan_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C8, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr ULONG ls_query_code   = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C9, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
-constexpr ULONG LS_BUILD_TAG    = 0x00080002; // LegendScan build: init/read/write(+MDL fallback)/module/alloc/free/version/scan/query
+constexpr ULONG ls_mods_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CA, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+constexpr ULONG LS_BUILD_TAG    = 0x00080003; // LegendScan build: +module-enum (PEB walk, BE-proof list)
 
 struct info_t {
     HANDLE  target_pid;
@@ -52,6 +53,19 @@ struct query_req_t {
     ULONG   protect;        // OUT: PAGE_* (masked)
     ULONG   type;           // OUT: MEM_PRIVATE/MAPPED/IMAGE
     UCHAR   ok;             // OUT: 1 = valid
+};
+
+// Module-enum request — full PEB LDR walk in kernel (Toolhelp-proof: no usermode handle)
+#define LS_MODS_MAX 128
+struct ls_mod_t {
+    PVOID base;
+    ULONG size;
+    WCHAR name[64];         // BaseDllName, truncated
+};
+struct ls_mods_req_t {
+    ULONG     count;        // OUT: modules returned
+    ULONG     max;          // IN: cap (clamped to LS_MODS_MAX)
+    ls_mod_t  mods[LS_MODS_MAX];
 };
 
 static PEPROCESS  g_target_process = nullptr;
@@ -661,6 +675,42 @@ NTSTATUS ctl_io(PDEVICE_OBJECT dev, PIRP irp) {
         ObDereferenceObject(proc);
         break;
     }
+    case ls_mods_code: {
+        if (!sysbuf || inLen < sizeof(ls_mods_req_t) || outLen < sizeof(ls_mods_req_t)) { status = STATUS_INVALID_PARAMETER; break; }
+        auto req = (ls_mods_req_t*)sysbuf;
+        if (req->max == 0 || req->max > LS_MODS_MAX) req->max = LS_MODS_MAX;
+        PEPROCESS proc = AcquireTargetRef();
+        if (!proc) { status = STATUS_INVALID_HANDLE; break; }
+        ULONG found = 0;
+        KAPC_STATE apc;
+        KeStackAttachProcess(proc, &apc);
+        __try {
+            PPEB peb = PsGetProcessPeb(proc);
+            if (peb && peb->Ldr) {
+                for (PLIST_ENTRY e = peb->Ldr->InLoadOrderModuleList.Flink;
+                     e != &peb->Ldr->InLoadOrderModuleList && found < req->max;
+                     e = e->Flink) {
+                    auto mod = CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+                    if (!mod->DllBase) continue;
+                    req->mods[found].base = mod->DllBase;
+                    req->mods[found].size = mod->SizeOfImage;
+                    RtlZeroMemory(req->mods[found].name, sizeof(req->mods[found].name));
+                    if (mod->BaseDllName.Buffer && mod->BaseDllName.Length) {
+                        ULONG copy = mod->BaseDllName.Length;
+                        if (copy > sizeof(req->mods[found].name) - sizeof(WCHAR))
+                            copy = sizeof(req->mods[found].name) - sizeof(WCHAR);
+                        RtlCopyMemory(req->mods[found].name, mod->BaseDllName.Buffer, copy);
+                    }
+                    found++;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(proc);
+        req->count = found;
+        status = STATUS_SUCCESS;
+        break;
+    }
     case ls_query_code: {
         if (!sysbuf || inLen < sizeof(query_req_t) || outLen < sizeof(query_req_t)) { status = STATUS_INVALID_PARAMETER; break; }
         auto req = (query_req_t*)sysbuf;
@@ -695,6 +745,7 @@ NTSTATUS ctl_io(PDEVICE_OBJECT dev, PIRP irp) {
     // report full struct size per code so usermode gets OUT fields
     if (code == ls_scan_code) irp->IoStatus.Information = sizeof(scan_req_t);
     else if (code == ls_query_code) irp->IoStatus.Information = sizeof(query_req_t);
+    else if (code == ls_mods_code) irp->IoStatus.Information = sizeof(ls_mods_req_t);
     else irp->IoStatus.Information = sizeof(info_t);
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     return status;
