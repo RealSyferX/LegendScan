@@ -1,0 +1,62 @@
+;
+; amdfend.inf — LegendScan kernel driver (AMD CrashDefend cover)
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = amdfend.cat
+DriverVer   = ;
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+amdfend.sys = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%amdfend.DeviceDesc% = amdfend_Device, Root\amdfend
+
+[amdfend_Device.NT]
+CopyFiles = File_Copy
+
+[File_Copy]
+amdfend.sys
+
+;-------------- Service installation
+[amdfend_Device.NT.Services]
+AddService = amdfend,%SPSVCINST_ASSOCSERVICE%, amdfend_Service_Inst
+
+; -------------- amdfend driver install sections
+[amdfend_Service_Inst]
+DisplayName    = %amdfend.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\amdfend.sys
+
+[amdfend_Device.NT.Wdf]
+KmdfService = amdfend, amdfend_wdfsect
+
+[amdfend_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "AMD"
+DiskName = "amdfend Installation Disk"
+amdfend.DeviceDesc = "amdfend Device"
+amdfend.SVCDESC = "amdfend Service"
