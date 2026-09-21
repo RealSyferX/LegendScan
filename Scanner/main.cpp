@@ -85,19 +85,24 @@ static UINT64 g_optStop = 0x7FFFFFFFFFFFULL;
 static int  g_optPreset = 0; // 0=All 1=Private 2=Image 3=Mapped
 static const size_t MAX_HITS = 500000;
 
-// Address table (bottom, like CE)
+// Address table (bottom, like CE). Two base kinds: absolute addr, or "module"+modOff (static).
+// Pointer chain (CE semantic): p=base; for each offs[i]: p=*(p+offs[i]); final=p.
 struct TblEntry {
     bool active = false;
     char desc[64]{};
-    UINT64 addr = 0;      // base address (or pointer holder when isPtr)
+    UINT64 addr = 0;      // absolute base (when mod empty)
+    char mod[64]{};       // module name, "" = absolute
+    UINT64 modOff = 0;    // offset from module base
     int vtype = V_U32;
     BYTE bytes[32]{};
     ULONG len = 4;
     bool isSigned = false;
     bool hexDisp = false;
     bool isPtr = false;
-    UINT64 ptrOff = 0;
+    UINT64 ptrOffs[5]{};
+    int nOff = 0;
 };
+#define PTR_MAX 5
 static int g_editRow = -1; // table row targeted by Change Value/Type/Desc popups
 static bool g_editReplace = false; // true = Address dialog edits row in place (Cancel keeps it)
 static std::vector<TblEntry> g_table;
@@ -120,8 +125,12 @@ enum {
     // manual-add dialog (popup)
     DLG_X = 1000, DLG_DESC_EDIT, DLG_ADDR_EDIT, DLG_TYPE_CB, DLG_VAL_EDIT, DLG_OK_BTN, DLG_CANCEL_BTN,
     DLG_HEX_CHK = 1020, DLG_SIGNED_CHK, DLG_PTR_CHK, DLG_OFF_EDIT, DLG_PREVIEW,
+    DLG_OFF0 = 1030, DLG_OFF1, DLG_OFF2, DLG_OFF3, DLG_OFF4,
+    DLG_CHAIN = 1035, DLG_ADD_OFF, DLG_REM_OFF,
     // process list dialog
     PL_LIST = 1010, PL_REFRESH, PL_EDIT,
+    // table/found context menu
+    CTX_DEL = 9110, CTX_VAL, CTX_TYPE, CTX_DESC, CTX_ADDR, CTX_ADD,
     // mem viewer popup
     MV_X = 1100, MV_ADDR_EDIT, MV_SIZE_EDIT, MV_DUMP_BTN, MV_WRITE_EDIT, MV_WRITE_BTN, MV_HEX_EDIT
 };
@@ -241,15 +250,75 @@ static std::string fmt_valx(int vtype, const BYTE* b, ULONG len, bool hex, bool 
     else return fmt_val(vtype, b, len, hex);
     return out;
 }
-// Resolve table/live pointer: final = *(uint64*)base + off
-static bool resolve_live(UINT64 base, bool isPtr, UINT64 off, UINT64& out) {
-    if (!isPtr) { out = base; return true; }
-    if (!g_drv || !g_attached) return false;
-    UINT64 pb = 0;
-    g_drv->read_raw(base, (BYTE*)&pb, 8);
-    if (!pb) return false;
-    out = pb + off;
+// Parse CE address expression: "mod"+OFF | "mod" | mod+OFF | plain hex (absolute)
+static bool parse_addr_expr(const char* s, std::string& mod, UINT64& absOut, UINT64& modOff, bool& isMod) {
+    char tmp[320]; snprintf(tmp, sizeof(tmp), "%s", s ? s : "");
+    while (*tmp && isspace((unsigned char)*tmp)) memmove(tmp, tmp + 1, strlen(tmp));
+    size_t L = strlen(tmp);
+    while (L && isspace((unsigned char)tmp[L - 1])) tmp[--L] = 0;
+    if (!L) return false;
+    mod.clear(); absOut = 0; modOff = 0; isMod = false;
+    if (tmp[0] == '"') {
+        char* end = strchr(tmp + 1, '"');
+        if (!end) return false;
+        *end = 0;
+        if (!tmp[1]) return false;
+        mod = tmp + 1; isMod = true;
+        char* rest = end + 1;
+        while (*rest && isspace((unsigned char)*rest)) rest++;
+        if (*rest == '+') modOff = strtoull(rest + 1, nullptr, 16);
+        return true;
+    }
+    char* plus = strrchr(tmp, '+');
+    if (plus && plus != tmp) {
+        *plus = 0;
+        char* left = tmp;
+        while (*left && isspace((unsigned char)*left)) left++;
+        size_t ll = strlen(left);
+        while (ll && isspace((unsigned char)left[ll - 1])) left[--ll] = 0;
+        bool hasDot = strchr(left, '.') != nullptr;
+        if (hasDot && ll) {
+            mod = left; modOff = strtoull(plus + 1, nullptr, 16); isMod = true;
+            return true;
+        }
+        // absolute base + offset arithmetic
+        absOut = strtoull(left, nullptr, 16) + strtoull(plus + 1, nullptr, 16);
+        return true;
+    }
+    absOut = strtoull(tmp, nullptr, 16);
     return true;
+}
+static UINT64 mod_base(const char* mod) {
+    if (!g_drv || !g_attached || !mod || !*mod) return 0;
+    wchar_t w[260]{};
+    MultiByteToWideChar(CP_ACP, 0, mod, -1, w, 260);
+    return (UINT64)g_drv->module_base(w);
+}
+// Final address of a table entry (module rebase-safe + pointer chain)
+static bool entry_final(const TblEntry& e, UINT64& out) {
+    UINT64 base = e.addr;
+    if (e.mod[0]) {
+        base = mod_base(e.mod);
+        if (!base) return false;
+        base += e.modOff;
+    }
+    if (!e.isPtr || e.nOff <= 0) { out = base; return true; }
+    if (!g_drv || !g_attached) return false;
+    UINT64 p = base;
+    for (int i = 0; i < e.nOff && i < PTR_MAX; i++) {
+        UINT64 v = 0;
+        g_drv->read_raw(p + e.ptrOffs[i], (BYTE*)&v, 8);
+        if (!v) return false;
+        p = v;
+    }
+    out = p;
+    return true;
+}
+// Printable base of an entry: "mod"+OFF or hex
+static std::string entry_base_str(const TblEntry& e, char* buf, size_t n) {
+    if (e.mod[0]) snprintf(buf, n, "\"%s\"+%llX", e.mod, (unsigned long long)e.modOff);
+    else snprintf(buf, n, "%llX", (unsigned long long)e.addr);
+    return buf;
 }
 static const char* vtypeName(int v) {
     switch (v) {
@@ -355,19 +424,20 @@ static void refresh_table() {
     std::lock_guard<std::mutex> lk(g_tableMtx);
     LVITEMA it{}; it.mask = LVIF_TEXT | LVIF_STATE;
     it.stateMask = LVIS_STATEIMAGEMASK;
-    char a[48], v[128];
+    char a[128], v[128];
     for (size_t i = 0; i < g_table.size(); i++) {
         auto& e = g_table[i];
         BYTE cur[32]{};
         bool have = false;
         UINT64 f = e.addr;
-        if (g_drv && g_attached && resolve_live(e.addr, e.isPtr, e.ptrOff, f)) {
+        if (g_drv && g_attached && entry_final(e, f)) {
             g_drv->read_raw(f, cur, e.len);
             have = true;
         }
         if (!have) memcpy(cur, e.bytes, e.len);
-        if (e.isPtr) snprintf(a, sizeof(a), "P->%llX+%llX", (unsigned long long)e.addr, (unsigned long long)e.ptrOff);
-        else snprintf(a, sizeof(a), "%016llX", (unsigned long long)e.addr);
+        char bs[96]; entry_base_str(e, bs, sizeof(bs));
+        if (e.isPtr) snprintf(a, sizeof(a), "P->%s", bs);
+        else snprintf(a, sizeof(a), "%s", bs);
         std::string vs = have ? fmt_valx(e.vtype, cur, e.len, e.hexDisp, e.isSigned) : std::string("??");
         snprintf(v, sizeof(v), "%s", vs.c_str());
         it.iItem = (int)i; it.iSubItem = 0; it.pszText = (LPSTR)"";
@@ -390,7 +460,7 @@ static void refresh_table_live() {
         n = g_table.size();
     }
     if (ListView_GetItemCount(lv) != (int)n) { refresh_table(); return; } // rows added/removed: rebuild
-    char a[48], v[128];
+    char a[128], v[128];
     for (size_t i = 0; i < n; i++) {
         TblEntry e;
         {
@@ -400,13 +470,14 @@ static void refresh_table_live() {
         BYTE cur[32]{};
         bool have = false;
         UINT64 f = e.addr;
-        if (g_drv && g_attached && resolve_live(e.addr, e.isPtr, e.ptrOff, f)) {
+        if (g_drv && g_attached && entry_final(e, f)) {
             g_drv->read_raw(f, cur, e.len);
             have = true;
         }
         if (!have) memcpy(cur, e.bytes, e.len);
-        if (e.isPtr) snprintf(a, sizeof(a), "P->%llX+%llX", (unsigned long long)e.addr, (unsigned long long)e.ptrOff);
-        else snprintf(a, sizeof(a), "%016llX", (unsigned long long)e.addr);
+        char bs[96]; entry_base_str(e, bs, sizeof(bs));
+        if (e.isPtr) snprintf(a, sizeof(a), "P->%s", bs);
+        else snprintf(a, sizeof(a), "%s", bs);
         std::string vs = have ? fmt_valx(e.vtype, cur, e.len, e.hexDisp, e.isSigned) : std::string("??");
         snprintf(v, sizeof(v), "%s", vs.c_str());
         lv_set_text(lv, (int)i, 2, a);
@@ -635,7 +706,7 @@ static void FreezeThread() {
         for (auto& e : g_table) {
             if (!e.active) continue;
             UINT64 f = e.addr;
-            if (!resolve_live(e.addr, e.isPtr, e.ptrOff, f)) continue;
+            if (!entry_final(e, f)) continue;
             g_drv->write_bytes(f, e.bytes, e.len);
         }
     }
@@ -804,24 +875,59 @@ static ULONG dlgTypeLen(int realVt) {
     if (realVt == V_U64 || realVt == V_F64) return 8;
     return 16; // String / AoB default window
 }
-static void updateManualPreview(HWND h) {
-    std::string a = dlgText(h, DLG_ADDR_EDIT);
-    UINT64 base = strtoull(a.c_str(), nullptr, 16); // hex
+static int g_dlgNOff = 1; // visible offset rows in manual dialog
+static int dlgOffId(int i) { return DLG_OFF0 + i; }
+// Gather dialog base expression + pointer chain. Returns false when base empty.
+static bool dlgGather(HWND h, std::string& mod, UINT64& absBase, UINT64& modOff, bool& isMod, UINT64 offs[PTR_MAX], int& n) {
+    n = 0;
+    if (!parse_addr_expr(dlgText(h, DLG_ADDR_EDIT).c_str(), mod, absBase, modOff, isMod)) return false;
     bool isPtr = SendMessageA(GetDlgItem(h, DLG_PTR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    UINT64 off = strtoull(dlgText(h, DLG_OFF_EDIT).c_str(), nullptr, 16); // hex
+    if (isPtr) {
+        n = (std::min)(g_dlgNOff, PTR_MAX);
+        if (n < 1) n = 1;
+        for (int i = 0; i < n; i++)
+            offs[i] = strtoull(dlgText(h, dlgOffId(i)).c_str(), nullptr, 16);
+    }
+    return true;
+}
+static void updateManualPreview(HWND h) {
+    std::string mod; UINT64 absBase = 0, modOff = 0; bool isMod = false;
+    UINT64 offs[PTR_MAX]{}; int n = 0;
     int rv = dlgRealVtype(h);
     ULONG len = dlgTypeLen(rv);
     bool isHex = SendMessageA(GetDlgItem(h, DLG_HEX_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool isSgn = SendMessageA(GetDlgItem(h, DLG_SIGNED_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     char prev[128]; snprintf(prev, sizeof(prev), "=???");
-    UINT64 f = base;
-    if (base && g_drv && g_attached && resolve_live(base, isPtr, off, f)) {
-        BYTE cur[32]{};
-        g_drv->read_raw(f, cur, len);
-        std::string vs = fmt_valx(rv, cur, len, isHex, isSgn);
-        snprintf(prev, sizeof(prev), "=%.60s", vs.c_str());
+    std::string chain;
+    if (dlgGather(h, mod, absBase, modOff, isMod, offs, n)) {
+        // resolve base
+        UINT64 base = 0; bool baseOk = false;
+        char baseLine[160]{};
+        if (isMod) {
+            base = mod_base(mod.c_str());
+            if (base) { base += modOff; baseOk = true; snprintf(baseLine, sizeof(baseLine), "\"%s\"+%llX = %llX", mod.c_str(), (unsigned long long)modOff, (unsigned long long)base); }
+            else snprintf(baseLine, sizeof(baseLine), "\"%s\"+%llX = ???", mod.c_str(), (unsigned long long)modOff);
+        }
+        else { base = absBase; baseOk = base != 0; snprintf(baseLine, sizeof(baseLine), "%llX", (unsigned long long)base); }
+        chain = baseLine;
+        UINT64 p = base; bool ok = baseOk && g_drv && g_attached;
+        for (int i = 0; ok && i < n; i++) {
+            UINT64 v = 0;
+            g_drv->read_raw(p + offs[i], (BYTE*)&v, 8);
+            char step[64]; snprintf(step, sizeof(step), "\r\n+%llX -> %llX", (unsigned long long)offs[i], (unsigned long long)v);
+            chain += step;
+            if (!v) ok = false; else p = v;
+        }
+        if (ok && p) {
+            BYTE cur[32]{};
+            g_drv->read_raw(p, cur, len);
+            std::string vs = fmt_valx(rv, cur, len, isHex, isSgn);
+            snprintf(prev, sizeof(prev), "=%.60s", vs.c_str());
+        }
     }
     SetDlgItemTextA(h, DLG_PREVIEW, prev);
+    HWND ch = GetDlgItem(h, DLG_CHAIN);
+    if (ch) SetWindowTextA(ch, chain.c_str());
 }
 // Parse Change-Value text into entry bytes (hex when 0x-prefixed or hex flag)
 static bool parse_entry_value(const TblEntry& e, const char* txt, bool hex, BYTE out[32]) {
@@ -863,8 +969,25 @@ static bool parse_entry_value(const TblEntry& e, const char* txt, bool hex, BYTE
     else { uint64_t x = (uint64_t)v; memcpy(out, &x, 8); }
     return true;
 }
-static void OpenManualAdd(const char* addrPref, int vtypePref, bool isPtrPref = false, UINT64 offPref = 0, bool signedPref = false, const char* descPref = nullptr, const char* titlePref = nullptr) {
+static void layoutManualDlg(HWND h) {
+    // small (plain address) vs big (pointer chain) layout
+    bool isPtr = SendMessageA(GetDlgItem(h, DLG_PTR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    int okY = isPtr ? 424 : 222;
+    SetWindowPos(GetDlgItem(h, DLG_OK_BTN), nullptr, 12, okY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    SetWindowPos(GetDlgItem(h, DLG_CANCEL_BTN), nullptr, 152, okY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    SetWindowPos(h, nullptr, 0, 0, 300, isPtr ? 510 : 300, SWP_NOMOVE | SWP_NOZORDER);
+    for (int i = 0; i < PTR_MAX; i++) {
+        HWND oe = GetDlgItem(h, dlgOffId(i));
+        if (oe) ShowWindow(oe, (isPtr && i < g_dlgNOff) ? SW_SHOW : SW_HIDE);
+    }
+    ShowWindow(GetDlgItem(h, DLG_CHAIN), isPtr ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(h, DLG_ADD_OFF), isPtr ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(h, DLG_REM_OFF), isPtr ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(h, DLG_OFF_EDIT), SW_HIDE); // legacy single offset retired
+}
+static void OpenManualAdd(const char* addrPref, int vtypePref, bool isPtrPref = false, const UINT64* offsPref = nullptr, int nOffPref = 0, bool signedPref = false, const char* descPref = nullptr, const char* titlePref = nullptr) {
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
+    g_dlgNOff = (isPtrPref && nOffPref > 0) ? (std::min)(nOffPref, PTR_MAX) : 1;
     g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "LSManualCls", titlePref ? titlePref : "Add address", WS_POPUP | WS_CAPTION | WS_SYSMENU, 300, 200, 300, 300, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_dlg;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
@@ -886,18 +1009,26 @@ static void OpenManualAdd(const char* addrPref, int vtypePref, bool isPtrPref = 
     HWND hx = c("BUTTON", "Hexadecimal", BS_AUTOCHECKBOX, 12, 162, 110, 22, DLG_HEX_CHK);
     HWND sg = c("BUTTON", "Signed", BS_AUTOCHECKBOX, 130, 162, 80, 22, DLG_SIGNED_CHK);
     HWND pc = c("BUTTON", "Pointer", BS_AUTOCHECKBOX, 12, 188, 80, 22, DLG_PTR_CHK);
-    HWND oe = c("EDIT", "0", WS_BORDER | ES_AUTOHSCROLL, 100, 186, 172, 24, DLG_OFF_EDIT);
+    c("EDIT", "0", WS_BORDER | ES_AUTOHSCROLL, 100, 186, 172, 24, DLG_OFF_EDIT); // hidden legacy
+    // offset rows + chain (pointer mode)
+    for (int i = 0; i < PTR_MAX; i++)
+        c("EDIT", "0", WS_BORDER | ES_AUTOHSCROLL, 100, 214 + i * 26, 100, 22, dlgOffId(i));
+    c("STATIC", "", SS_LEFT, 12, 344, 260, 56, DLG_CHAIN);
+    c("BUTTON", "Add Offset", BS_PUSHBUTTON, 12, 404, 120, 24, DLG_ADD_OFF);
+    c("BUTTON", "Remove Offset", BS_PUSHBUTTON, 142, 404, 130, 24, DLG_REM_OFF);
     if (signedPref) SendMessageA(sg, BM_SETCHECK, BST_CHECKED, 0);
     if (isPtrPref) {
         SendMessageA(pc, BM_SETCHECK, BST_CHECKED, 0);
-        char ob[32]; snprintf(ob, sizeof(ob), "%llX", (unsigned long long)offPref);
-        SetWindowTextA(oe, ob);
+        for (int i = 0; i < g_dlgNOff && offsPref; i++) {
+            char ob[32]; snprintf(ob, sizeof(ob), "%llX", (unsigned long long)offsPref[i]);
+            SetDlgItemTextA(p, dlgOffId(i), ob);
+        }
     }
-    else ShowWindow(oe, SW_HIDE);
     (void)hx;
     c("BUTTON", "OK", BS_DEFPUSHBUTTON, 12, 222, 120, 28, DLG_OK_BTN);
     c("BUTTON", "Cancel", BS_PUSHBUTTON, 152, 222, 120, 28, DLG_CANCEL_BTN);
     SetWindowLongPtrA(p, GWLP_USERDATA, 0); // mode 0 = manual add
+    layoutManualDlg(p);
     ShowWindow(p, SW_SHOW);
     updateManualPreview(p);
 }
@@ -914,7 +1045,7 @@ static void OpenChangeValue(const TblEntry& e) {
     c("STATIC", "what value to change this to?", SS_LEFT, 12, 12, 290, 20, -1);
     BYTE cur[32]{};
     UINT64 f = e.addr;
-    bool have = (g_drv && g_attached && resolve_live(e.addr, e.isPtr, e.ptrOff, f));
+    bool have = (g_drv && g_attached && entry_final(e, f));
     if (have) g_drv->read_raw(f, cur, e.len); else memcpy(cur, e.bytes, e.len);
     std::string vs = fmt_valx(e.vtype, cur, e.len, e.hexDisp, e.isSigned);
     c("EDIT", vs.c_str(), WS_BORDER | ES_AUTOHSCROLL, 12, 36, 290, 24, DLG_VAL_EDIT);
@@ -1217,7 +1348,41 @@ static void doAddSelectedToTable() {
         if ((size_t)sel < g_cands.size()) addr = g_cands[(size_t)sel].addr;
     }
     char ab[32]; snprintf(ab, sizeof(ab), "%llX", (unsigned long long)addr);
-    OpenManualAdd(ab, g_vtype, false, 0, false);
+    OpenManualAdd(ab, g_vtype);
+}
+static void TableDeleteSel() {
+    HWND lv = ctl(IDC_TBL_LIST);
+    int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+    if (sel < 0) { setStatus("Select a table row first"); return; }
+    {
+        std::lock_guard<std::mutex> lk(g_tableMtx);
+        if ((size_t)sel >= g_table.size()) return;
+        g_table.erase(g_table.begin() + sel);
+    }
+    refresh_table();
+    setStatus("Deleted address");
+}
+// Column action shared by double-click + right-click menu (col: 4=Value 3=Type 1=Desc else Address)
+static void TableAct(int sel, int col) {
+    if (sel < 0) return;
+    TblEntry e; bool got = false;
+    {
+        std::lock_guard<std::mutex> lk(g_tableMtx);
+        if ((size_t)sel < g_table.size()) { e = g_table[(size_t)sel]; got = true; }
+    }
+    if (!got) return;
+    g_editRow = sel;
+    if (col == 4) OpenChangeValue(e);
+    else if (col == 3) OpenChangeType(e);
+    else if (col == 1) OpenChangeDesc(e);
+    else {
+        char ab[160];
+        if (e.mod[0]) snprintf(ab, sizeof(ab), "\"%s\"+%llX", e.mod, (unsigned long long)e.modOff);
+        else snprintf(ab, sizeof(ab), "%llX", (unsigned long long)e.addr);
+        int dlgVt = (e.vtype == V_U8) ? 0 : (e.vtype == V_U16) ? 1 : (e.vtype == V_U32) ? 2 : (e.vtype == V_U64) ? 3 : (e.vtype == V_F32) ? 4 : (e.vtype == V_F64) ? 5 : (e.vtype == V_STR) ? 6 : 7;
+        g_editReplace = true;
+        OpenManualAdd(ab, dlgVt, e.isPtr, e.ptrOffs, e.nOff, e.isSigned, e.desc, "Change address");
+    }
 }
 // CE behavior: double-click found row drops it straight into the table, no dialog
 static void doAddFoundToTableDirect() {
@@ -1234,7 +1399,7 @@ static void doAddFoundToTableDirect() {
     e.active = false;
     snprintf(e.desc, sizeof(e.desc), "No description");
     e.addr = addr; e.vtype = g_vtype; e.len = g_valLen ? g_valLen : 4;
-    e.isSigned = false; e.isPtr = false; e.ptrOff = 0;
+    e.isSigned = false; e.isPtr = false; e.nOff = 0;
     if (g_drv && g_attached) g_drv->read_raw(addr, e.bytes, e.len);
     {
         std::lock_guard<std::mutex> lk(g_tableMtx);
@@ -1259,15 +1424,27 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (mode0 == 0) {
             // live preview triggers (manual-add dialog)
-            if (((id == DLG_ADDR_EDIT || id == DLG_OFF_EDIT) && code == EN_CHANGE) ||
+            bool offEdit = (id >= DLG_OFF0 && id <= DLG_OFF4);
+            if (((id == DLG_ADDR_EDIT || offEdit) && code == EN_CHANGE) ||
                 (id == DLG_TYPE_CB && code == CBN_SELCHANGE) ||
                 ((id == DLG_HEX_CHK || id == DLG_SIGNED_CHK) && code == BN_CLICKED)) {
                 updateManualPreview(h);
                 return 0;
             }
             if (id == DLG_PTR_CHK && code == BN_CLICKED) {
-                bool on = SendMessageA(GetDlgItem(h, DLG_PTR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
-                ShowWindow(GetDlgItem(h, DLG_OFF_EDIT), on ? SW_SHOW : SW_HIDE);
+                layoutManualDlg(h);
+                updateManualPreview(h);
+                return 0;
+            }
+            if (id == DLG_ADD_OFF) {
+                if (g_dlgNOff < PTR_MAX) g_dlgNOff++;
+                layoutManualDlg(h);
+                updateManualPreview(h);
+                return 0;
+            }
+            if (id == DLG_REM_OFF) {
+                if (g_dlgNOff > 1) g_dlgNOff--;
+                layoutManualDlg(h);
                 updateManualPreview(h);
                 return 0;
             }
@@ -1292,7 +1469,7 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 BYTE nb[32]{};
                 if (!parse_entry_value(e, t.c_str(), e.hexDisp, nb)) { SetFocus(GetDlgItem(h, DLG_VAL_EDIT)); return 0; }
                 UINT64 f = e.addr;
-                if (!g_drv || !g_attached || !resolve_live(e.addr, e.isPtr, e.ptrOff, f)) { setStatus("Attach first"); DestroyWindow(h); return 0; }
+                if (!g_drv || !g_attached || !entry_final(e, f)) { setStatus("Attach first"); DestroyWindow(h); return 0; }
                 if (!g_drv->write_bytes(f, nb, e.len)) { setStatus("Write FAILED"); DestroyWindow(h); return 0; }
                 BYTE rb[32]{};
                 g_drv->read_raw(f, rb, e.len);
@@ -1322,7 +1499,7 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                         te.vtype = realVt; te.len = dlgTypeLen(realVt);
                         te.hexDisp = hx; te.isSigned = sg;
                         UINT64 f = te.addr;
-                        if (g_drv && g_attached && resolve_live(te.addr, te.isPtr, te.ptrOff, f))
+                        if (g_drv && g_attached && entry_final(te, f))
                             g_drv->read_raw(f, te.bytes, te.len);
                     }
                 }
@@ -1346,15 +1523,21 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 return 0;
             }
             std::string d = dlgText(h, DLG_DESC_EDIT);
-            std::string a = dlgText(h, DLG_ADDR_EDIT);
+            std::string mod; UINT64 absBase = 0, modOff = 0; bool isMod = false;
+            if (!parse_addr_expr(dlgText(h, DLG_ADDR_EDIT).c_str(), mod, absBase, modOff, isMod)) { SetDlgItemTextA(h, DLG_PREVIEW, "bad address"); return 0; }
+            if (!isMod && !absBase) { SetDlgItemTextA(h, DLG_PREVIEW, "bad address"); return 0; }
             int realVt = dlgRealVtype(h);
             ULONG len = dlgTypeLen(realVt);
             bool isHex = SendMessageA(GetDlgItem(h, DLG_HEX_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
             bool isSgn = SendMessageA(GetDlgItem(h, DLG_SIGNED_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
             bool isPtr = SendMessageA(GetDlgItem(h, DLG_PTR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
-            UINT64 addr = strtoull(a.c_str(), nullptr, 16); // CE: address boxes are hex
-            UINT64 off = strtoull(dlgText(h, DLG_OFF_EDIT).c_str(), nullptr, 16); // hex
-            if (!addr) { SetDlgItemTextA(h, DLG_PREVIEW, "bad address"); return 0; }
+            UINT64 offs[PTR_MAX]{}; int nOff = 0;
+            if (isPtr) {
+                nOff = (std::min)(g_dlgNOff, PTR_MAX);
+                if (nOff < 1) nOff = 1;
+                for (int i = 0; i < nOff; i++)
+                    offs[i] = strtoull(dlgText(h, dlgOffId(i)).c_str(), nullptr, 16);
+            }
             TblEntry e{};
             bool keepActive = false;
             {
@@ -1365,24 +1548,31 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             e.active = keepActive;
             snprintf(e.desc, sizeof(e.desc), "%s", d.empty() ? "No description" : d.c_str());
-            e.addr = addr; e.vtype = realVt; e.len = len;
-            e.isSigned = isSgn; e.isPtr = isPtr; e.ptrOff = off;
+            if (isMod) {
+                // static address: rebase-safe via module
+                UINT64 mb = mod_base(mod.c_str());
+                if (!mb) { SetDlgItemTextA(h, DLG_PREVIEW, "module? (attach?)"); return 0; }
+                snprintf(e.mod, sizeof(e.mod), "%s", mod.c_str());
+                e.modOff = modOff; e.addr = mb + modOff;
+            }
+            else e.addr = absBase;
+            e.vtype = realVt; e.len = len;
+            e.isSigned = isSgn; e.isPtr = isPtr; e.nOff = nOff;
+            for (int i = 0; i < nOff; i++) e.ptrOffs[i] = offs[i];
             (void)isHex;
-            UINT64 f = addr;
-            if (g_drv && g_attached && resolve_live(addr, isPtr, off, f))
+            UINT64 f = e.addr;
+            if (g_drv && g_attached && entry_final(e, f))
                 g_drv->read_raw(f, e.bytes, e.len);
-            char s[160];
+            char s[200], bs[96]; entry_base_str(e, bs, sizeof(bs));
             {
                 std::lock_guard<std::mutex> lk(g_tableMtx);
                 if (g_editReplace && g_editRow >= 0 && (size_t)g_editRow < g_table.size()) {
                     g_table[(size_t)g_editRow] = e;
-                    if (isPtr) snprintf(s, sizeof(s), "Changed P->%llX+%llX (%s)", (unsigned long long)addr, (unsigned long long)off, vtypeName(realVt));
-                    else snprintf(s, sizeof(s), "Changed %016llX (%s)", (unsigned long long)addr, vtypeName(realVt));
+                    snprintf(s, sizeof(s), "Changed %s%s (%s)", isPtr ? "P->" : "", bs, vtypeName(realVt));
                 }
                 else {
                     g_table.push_back(e);
-                    if (isPtr) snprintf(s, sizeof(s), "Added P->%llX+%llX (%s)", (unsigned long long)addr, (unsigned long long)off, vtypeName(realVt));
-                    else snprintf(s, sizeof(s), "Added %016llX (%s)", (unsigned long long)addr, vtypeName(realVt));
+                    snprintf(s, sizeof(s), "Added %s%s (%s)", isPtr ? "P->" : "", bs, vtypeName(realVt));
                 }
             }
             g_editReplace = false;
@@ -1462,15 +1652,19 @@ static void SaveTableTo(const char* path) {
     FILE* f = nullptr;
     fopen_s(&f, path, "wb");
     if (!f) { setStatus("Save failed"); return; }
-    fprintf(f, "<LegendTable version=\"1\">\n");
+    fprintf(f, "<LegendTable version=\"2\">\n");
     std::lock_guard<std::mutex> lk(g_tableMtx);
     for (auto& e : g_table) {
         char hex[65]{};
         for (ULONG i = 0; i < e.len && i < 32; i++) snprintf(hex + i * 2, 3, "%02X", e.bytes[i]);
-        fprintf(f, "<Entry active=\"%d\" desc=\"%s\" addr=\"%llX\" type=\"%d\" len=\"%lu\" signed=\"%d\" hex=\"%d\" ptr=\"%d\" off=\"%llX\" bytes=\"%s\"/>\n",
+        char offs[96]{};
+        for (int i = 0; i < e.nOff && i < PTR_MAX; i++)
+            snprintf(offs + strlen(offs), sizeof(offs) - strlen(offs), "%s%llX", i ? "," : "", (unsigned long long)e.ptrOffs[i]);
+        fprintf(f, "<Entry active=\"%d\" desc=\"%s\" addr=\"%llX\" mod=\"%s\" moff=\"%llX\" type=\"%d\" len=\"%lu\" signed=\"%d\" hex=\"%d\" ptr=\"%d\" offs=\"%s\" bytes=\"%s\"/>\n",
             e.active ? 1 : 0, xml_esc(e.desc).c_str(), (unsigned long long)e.addr,
+            xml_esc(e.mod).c_str(), (unsigned long long)e.modOff,
             e.vtype, e.len, e.isSigned ? 1 : 0, e.hexDisp ? 1 : 0,
-            e.isPtr ? 1 : 0, (unsigned long long)e.ptrOff, hex);
+            e.isPtr ? 1 : 0, offs, hex);
     }
     fprintf(f, "</LegendTable>\n");
     fclose(f);
@@ -1500,6 +1694,9 @@ static bool LoadTableFrom(const char* path) {
         std::string d = xml_unesc(getAttr(tag, "desc"));
         snprintf(e.desc, sizeof(e.desc), "%s", d.empty() ? "No description" : d.c_str());
         e.addr = strtoull(getAttr(tag, "addr").c_str(), nullptr, 16);
+        std::string lm = xml_unesc(getAttr(tag, "mod"));
+        snprintf(e.mod, sizeof(e.mod), "%s", lm.c_str());
+        e.modOff = strtoull(getAttr(tag, "moff").c_str(), nullptr, 16);
         e.vtype = atoi(getAttr(tag, "type").c_str());
         if (e.vtype < 0 || e.vtype > 7) e.vtype = V_U32;
         e.len = (ULONG)atoi(getAttr(tag, "len").c_str());
@@ -1507,7 +1704,24 @@ static bool LoadTableFrom(const char* path) {
         e.isSigned = (getAttr(tag, "signed") == "1");
         e.hexDisp = (getAttr(tag, "hex") == "1");
         e.isPtr = (getAttr(tag, "ptr") == "1");
-        e.ptrOff = strtoull(getAttr(tag, "off").c_str(), nullptr, 16);
+        e.nOff = 0;
+        std::string lo = getAttr(tag, "offs");
+        if (!lo.empty()) {
+            // comma-separated hex offsets (v2)
+            size_t s = 0;
+            while (s < lo.size() && e.nOff < PTR_MAX) {
+                size_t c = lo.find(',', s);
+                std::string one = (c == std::string::npos) ? lo.substr(s) : lo.substr(s, c - s);
+                e.ptrOffs[e.nOff++] = strtoull(one.c_str(), nullptr, 16);
+                if (c == std::string::npos) break;
+                s = c + 1;
+            }
+        }
+        else if (e.isPtr) {
+            // v1 back-compat: single off meant *(base)+off == chain [0, off]
+            UINT64 old = strtoull(getAttr(tag, "off").c_str(), nullptr, 16);
+            e.ptrOffs[0] = 0; e.ptrOffs[1] = old; e.nOff = 2;
+        }
         std::string hb = getAttr(tag, "bytes");
         for (ULONG i = 0; i < e.len && i * 2 + 1 < hb.size(); i++) {
             BYTE hi, lo;
@@ -1526,7 +1740,7 @@ static bool LoadTableFrom(const char* path) {
         std::lock_guard<std::mutex> lk(g_tableMtx);
         for (auto& e : g_table) {
             UINT64 fa = e.addr;
-            if (resolve_live(e.addr, e.isPtr, e.ptrOff, fa))
+            if (entry_final(e, fa))
                 g_drv->read_raw(fa, e.bytes, e.len);
         }
     }
@@ -1658,6 +1872,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char path[MAX_PATH]{};
             if (TableFileDlg(true, path, MAX_PATH)) SaveTableTo(path);
         }
+        else if (id == CTX_DEL) TableDeleteSel();
+        else if (id == CTX_VAL || id == CTX_TYPE || id == CTX_DESC || id == CTX_ADDR) {
+            HWND lv = ctl(IDC_TBL_LIST);
+            int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+            if (sel < 0) { setStatus("Select a table row first"); }
+            else TableAct(sel, id == CTX_VAL ? 4 : id == CTX_TYPE ? 3 : id == CTX_DESC ? 1 : 2);
+        }
+        else if (id == CTX_ADD) doAddFoundToTableDirect();
         else if (id == 9003) { if (!g_connected) std::thread(DriverThread).detach(); }
         else if (id == IDC_FIRST_BTN || id == 9004) start_first();
         else if (id == IDC_NEXT_BTN || id == 9005) start_next();
@@ -1708,26 +1930,45 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int col = ia->iSubItem;
             if (sel < 0) sel = ListView_GetNextItem(nh->hwndFrom, -1, LVNI_SELECTED);
             if (sel < 0) return 0;
-            TblEntry e; bool got = false;
-            {
-                std::lock_guard<std::mutex> lk(g_tableMtx);
-                if ((size_t)sel < g_table.size()) { e = g_table[(size_t)sel]; got = true; }
-            }
-            if (!got) return 0;
-            g_editRow = sel;
-            if (col == 4) OpenChangeValue(e);
-            else if (col == 3) OpenChangeType(e);
-            else if (col == 1) OpenChangeDesc(e);
-            else {
-                // Address (or row/checkbox): CE Change-address dialog edits IN PLACE — entry stays put
-                char ab[32]; snprintf(ab, sizeof(ab), "%llX", (unsigned long long)e.addr);
-                int dlgVt = (e.vtype == V_U8) ? 0 : (e.vtype == V_U16) ? 1 : (e.vtype == V_U32) ? 2 : (e.vtype == V_U64) ? 3 : (e.vtype == V_F32) ? 4 : (e.vtype == V_F64) ? 5 : (e.vtype == V_STR) ? 6 : 7;
-                g_editReplace = true;
-                OpenManualAdd(ab, dlgVt, e.isPtr, e.ptrOff, e.isSigned, e.desc, "Change address");
-            }
+            TableAct(sel, col);
             return 0;
         }
+        if (nh->code == LVN_KEYDOWN) {
+            LPNMLVKEYDOWN kd = (LPNMLVKEYDOWN)lp;
+            if (kd->wVKey == VK_DELETE && nh->idFrom == (UINT_PTR)IDC_TBL_LIST) {
+                TableDeleteSel();
+                return 0;
+            }
+        }
         break;
+    }
+    case WM_CONTEXTMENU: {
+        HWND child = (HWND)wp;
+        bool isTbl = (child == ctl(IDC_TBL_LIST));
+        bool isFound = (child == ctl(IDC_FOUND_LIST));
+        if (!isTbl && !isFound) break;
+        int px = GET_X_LPARAM(lp), py = GET_Y_LPARAM(lp);
+        if (px == -1 && py == -1) { POINT cp{}; GetCursorPos(&cp); px = cp.x; py = cp.y; }
+        POINT cp{ px, py };
+        POINT cl = cp; ScreenToClient(child, &cl);
+        LVHITTESTINFO ht{}; ht.pt = cl;
+        int hit = ListView_HitTest(child, &ht);
+        if (hit >= 0) ListView_SetItemState(child, hit, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        HMENU m = CreatePopupMenu();
+        if (isTbl) {
+            AppendMenuA(m, MF_STRING, CTX_DEL, "Delete This Address");
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(m, MF_STRING, CTX_VAL, "Change Value");
+            AppendMenuA(m, MF_STRING, CTX_TYPE, "Change Type");
+            AppendMenuA(m, MF_STRING, CTX_DESC, "Change Description");
+            AppendMenuA(m, MF_STRING, CTX_ADDR, "Change Address...");
+        }
+        else {
+            AppendMenuA(m, MF_STRING, CTX_ADD, "Add to Address List");
+        }
+        TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON, px, py, 0, g_hwnd, nullptr);
+        DestroyMenu(m);
+        return 0;
     }
     case WM_TIMER:
         if (wp == 7) {
