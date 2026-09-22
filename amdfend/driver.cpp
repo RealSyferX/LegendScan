@@ -420,6 +420,10 @@ static PVOID GetModuleBaseAddress(PEPROCESS Process, const WCHAR* ModuleName) {
 }
 
 static NTSTATUS SafeCopy(PEPROCESS src, PVOID srcA, PEPROCESS dst, PVOID dstA, SIZE_T sz, PSIZE_T copied) {
+    // NOTE: no usermode-range check here on purpose. KernelScanRegion uses a
+    // NonPagedPool temp buffer (kernel VA) as one side of the copy, so a
+    // blanket user-range check breaks ALL scans (0 hits). Target validation
+    // lives in ctl_io (read/write/scan) + MdlWrite + KernelScanRegion start.
     NTSTATUS st = STATUS_UNSUCCESSFUL;
     __try { st = MmCopyVirtualMemory(src, srcA, dst, dstA, sz, KernelMode, copied); }
     __except (EXCEPTION_EXECUTE_HANDLER) { st = GetExceptionCode(); }
@@ -438,8 +442,16 @@ typedef NTSTATUS(NTAPI* ZwFreeVirtualMemory_t)(HANDLE, PVOID*, PSIZE_T, ULONG);
 
 // Write via MDL mapping — succeeds on PAGE_READONLY pages where MmCopy fails.
 // Probe IoReadAccess (passes on any readable page), then force mapping writable.
+// HARD RULE: usermode targets only. Kernel addresses are rejected outright so a
+// bad pointer chain (wrong offset -> garbage addr) can never bugcheck.
 static NTSTATUS MdlWrite(PEPROCESS proc, PVOID target, PVOID src, SIZE_T sz, PSIZE_T written) {
     if (!proc || !target || !src || !sz) return STATUS_INVALID_PARAMETER;
+    {
+        ULONG_PTR a = (ULONG_PTR)target;
+        constexpr ULONG_PTR kMaxUser = 0x7FFFFFFFFFFFULL;
+        if (a == 0 || a > kMaxUser || sz > 0x1000000 || sz > kMaxUser || a + sz < a || a + sz - 1 > kMaxUser)
+            return STATUS_ACCESS_VIOLATION;
+    }
     if (written) *written = 0;
     KAPC_STATE apc;
     KeStackAttachProcess(proc, &apc);
@@ -497,6 +509,12 @@ static NTSTATUS KernelScanRegion(PEPROCESS proc, PVOID start, SIZE_T size,
     UINT64* outHits, ULONG maxHits, PULONG outCount) {
     if (!proc || !start || !size || !pat || !msk || !patLen || patLen > 32) return STATUS_INVALID_PARAMETER;
     if (!outHits || !outCount || !maxHits) return STATUS_INVALID_PARAMETER;
+    {
+        ULONG_PTR a = (ULONG_PTR)start;
+        constexpr ULONG_PTR kMaxUser = 0x7FFFFFFFFFFFULL;
+        if (a == 0 || a > kMaxUser || size > kMaxUser || a + size < a || a + size - 1 > kMaxUser)
+            return STATUS_ACCESS_VIOLATION;
+    }
     if (maxHits > LS_SCAN_MAXHITS) maxHits = LS_SCAN_MAXHITS;
     *outCount = 0;
 
@@ -586,6 +604,11 @@ NTSTATUS ctl_io(PDEVICE_OBJECT dev, PIRP irp) {
     case ls_read_code: {
         if (!sysbuf || inLen < sizeof(info_t)) { status = STATUS_INVALID_PARAMETER; break; }
         auto buf = (info_t*)sysbuf;
+        {
+            ULONG_PTR a = (ULONG_PTR)buf->target_address;
+            constexpr ULONG_PTR kMaxUser = 0x7FFFFFFFFFFFULL;
+            if (!a || a > kMaxUser || !buf->size || buf->size > kMaxUser || a + buf->size < a || a + buf->size - 1 > kMaxUser) { status = STATUS_ACCESS_VIOLATION; break; }
+        }
         PEPROCESS proc = AcquireTargetRef();
         if (!proc) { status = STATUS_INVALID_HANDLE; break; }
         status = SafeCopy(proc, buf->target_address, PsGetCurrentProcess(), buf->buffer_address, buf->size, &buf->return_size);
@@ -596,6 +619,11 @@ NTSTATUS ctl_io(PDEVICE_OBJECT dev, PIRP irp) {
         if (!sysbuf || inLen < sizeof(info_t)) { status = STATUS_INVALID_PARAMETER; break; }
         auto buf = (info_t*)sysbuf;
         if (buf->size == 0 || buf->size > 0x1000000) { status = STATUS_INVALID_PARAMETER; break; }
+        {
+            ULONG_PTR a = (ULONG_PTR)buf->target_address;
+            constexpr ULONG_PTR kMaxUser = 0x7FFFFFFFFFFFULL;
+            if (!a || a > kMaxUser || a + buf->size < a || a + buf->size - 1 > kMaxUser) { status = STATUS_ACCESS_VIOLATION; break; }
+        }
         PEPROCESS proc = AcquireTargetRef();
         if (!proc) { status = STATUS_INVALID_HANDLE; break; }
         status = SafeCopy(PsGetCurrentProcess(), buf->buffer_address, proc, buf->target_address, buf->size, &buf->return_size);

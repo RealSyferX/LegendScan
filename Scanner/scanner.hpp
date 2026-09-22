@@ -121,6 +121,29 @@ public:
         if (!DeviceIoControl(m_h, ls_write_code, &io, sizeof(io), &io, sizeof(io), &br, nullptr)) return false;
         return io.return_size == sizeof(T);
     }
+    static bool is_user_range(UINT64 addr, SIZE_T sz) {
+        if (sz == 0) return false;
+        constexpr UINT64 kMaxUser = 0x7FFFFFFFFFFFULL;
+        if (addr == 0 || addr > kMaxUser) return false;
+        if (sz > kMaxUser) return false;
+        if (addr + sz < addr) return false; // overflow
+        if (addr + sz - 1 > kMaxUser) return false;
+        return true;
+    }
+    // Checked 8-byte pointer deref: validates usermode range + IOCTL success.
+    // Returns false on unreadable/invalid so callers never chase garbage into kernel.
+    bool read_u64_checked(UINT64 addr, UINT64& out) {
+        out = 0;
+        if (!is_user_range(addr, 8)) return false;
+        ls_info_t io{};
+        io.target_address = addr;
+        io.buffer_address = (UINT64)&out;
+        io.size = sizeof(UINT64);
+        DWORD br = 0;
+        if (!DeviceIoControl(m_h, ls_read_code, &io, sizeof(io), &io, sizeof(io), &br, nullptr)) return false;
+        if (io.return_size != sizeof(UINT64)) { out = 0; return false; }
+        return true;
+    }
     bool read_raw(UINT64 addr, void* out, SIZE_T sz) {
         // chunk via 8-byte fast path like DesAnime KernelWriteBytes — RPM has no chunk helper so loop 8s
         BYTE* dst = (BYTE*)out;
@@ -140,6 +163,7 @@ public:
         return true;
     }
     bool write_bytes(UINT64 addr, const void* data, SIZE_T sz) {
+        if (!is_user_range(addr, sz)) return false;
         const BYTE* src = (const BYTE*)data;
         SIZE_T done = 0;
         while (done + 8 <= sz) {

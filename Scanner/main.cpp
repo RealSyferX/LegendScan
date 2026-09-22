@@ -270,9 +270,9 @@ enum {
     CTX_DEL = 9110, CTX_VAL, CTX_TYPE, CTX_DESC, CTX_ADDR, CTX_ADD, CTX_PS,
     // pointer scan windows
     PS_PROG_STAT = 1060, PS_STOP,
-    PS_RES_LIST = 1062, PS_RESCAN, PS_ADD, PS_SAVE, PS_CLOSEB,
+    PS_RES_LIST = 1062, PS_RESCAN, PS_ADD, PS_SAVE, PS_CLOSEB, PS_OPENB,
     PSO_ADDR = 1070, PSO_DIFF, PSO_THR, PSO_MAXOFF, PSO_LVL,
-    PSR_ADDR = 1080,
+    PSR_ADDR = 1080, PSR_VALID,
     // settings dialog
     SET_MODCHK = 1040,
     // mem viewer popup
@@ -439,6 +439,8 @@ static UINT64 mod_base(const char* mod) {
     return (UINT64)g_drv->module_base(w);
 }
 // Final address of a table entry (module rebase-safe + pointer chain)
+// CE semantic (matches PSLevel generation): deref-then-add.
+//   p = base; for each off: p = *(p) + off;  final = p holds the value.
 static bool entry_final(const TblEntry& e, UINT64& out) {
     UINT64 base = e.addr;
     if (e.mod[0]) {
@@ -448,12 +450,16 @@ static bool entry_final(const TblEntry& e, UINT64& out) {
     }
     if (!e.isPtr || e.nOff <= 0) { out = base; return true; }
     if (!g_drv || !g_attached) return false;
+    if (!ls_driver::is_user_range(base, 8)) return false;
     UINT64 p = base;
     for (int i = 0; i < e.nOff && i < PTR_MAX; i++) {
         UINT64 v = 0;
-        g_drv->read_raw(p + e.ptrOffs[i], (BYTE*)&v, 8);
+        if (!g_drv->read_u64_checked(p, v)) return false;
         if (!v) return false;
-        p = v;
+        UINT64 nxt = v + e.ptrOffs[i];
+        if (nxt < v) return false; // overflow -> reject (would wrap into kernel)
+        if (!ls_driver::is_user_range(nxt, 1)) return false;
+        p = nxt;
     }
     out = p;
     return true;
@@ -1351,12 +1357,15 @@ static void updateManualPreview(HWND h) {
         else { base = absBase; baseOk = base != 0; snprintf(baseLine, sizeof(baseLine), "%llX", (unsigned long long)base); }
         chain = baseLine;
         UINT64 p = base; bool ok = baseOk && g_drv && g_attached;
+        if (ok && !ls_driver::is_user_range(p, 8)) ok = false;
         for (int i = 0; ok && i < n; i++) {
             UINT64 v = 0;
-            g_drv->read_raw(p + offs[i], (BYTE*)&v, 8);
-            char step[64]; snprintf(step, sizeof(step), "\r\n+%llX -> %llX", (unsigned long long)offs[i], (unsigned long long)v);
+            if (!g_drv->read_u64_checked(p, v) || !v) { ok = false; break; }
+            UINT64 nxt = v + offs[i];
+            if (nxt < v || !ls_driver::is_user_range(nxt, 1)) { ok = false; break; }
+            char step[96]; snprintf(step, sizeof(step), "\r\n*%llX=%llX+%llX -> %llX", (unsigned long long)p, (unsigned long long)v, (unsigned long long)offs[i], (unsigned long long)nxt);
             chain += step;
-            if (!v) ok = false; else p = v;
+            p = nxt;
         }
         if (ok && p) {
             BYTE cur[32]{};
@@ -1871,6 +1880,82 @@ static void doAddFoundToTableDirect() {
 //=================================================================
 static bool g_ctxFound = false; // context menu source: found list vs table
 
+// .lps file dialog (pointerlist) — separate from .ltb table dialog
+static std::string xml_unesc(const std::string& s); // fwd: defined in Legend Table section
+static std::string getAttr(const std::string& tag, const char* name); // fwd
+static bool PS_FileDlg(bool save, char* out, int outSz) {
+    OPENFILENAMEA of{};
+    of.lStructSize = sizeof(of);
+    of.hwndOwner = g_psWin ? g_psWin : g_hwnd;
+    of.lpstrFilter = "Legend Pointerlist (*.lps)\0*.lps\0All files (*.*)\0*.*\0";
+    of.lpstrDefExt = "lps";
+    of.nFilterIndex = 1;
+    of.lpstrFile = out;
+    of.nMaxFile = (DWORD)outSz;
+    of.Flags = save ? (OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST) : (OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST);
+    return save ? (GetSaveFileNameA(&of) == TRUE) : (GetOpenFileNameA(&of) == TRUE);
+}
+static void PS_RefreshResList(); // fwd (defined below, used by Load)
+static bool PS_LoadList(const char* path) {
+    FILE* f = nullptr;
+    fopen_s(&f, path, "rb");
+    if (!f) { setStatus("Open pointerlist failed"); return false; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 100000000) { fclose(f); setStatus("Bad pointerlist file"); return false; }
+    std::string data((size_t)sz, 0);
+    if (fread(&data[0], 1, (size_t)sz, f) != (size_t)sz) { fclose(f); setStatus("Read failed"); return false; }
+    fclose(f);
+    size_t hp = data.find("<LegendPointers");
+    if (hp == std::string::npos) { setStatus("Not a pointerlist (.lps)"); return false; }
+    size_t he = data.find('>', hp);
+    std::string head = (he == std::string::npos) ? "" : data.substr(hp, he - hp);
+    UINT64 target = strtoull(getAttr(head, "target").c_str(), nullptr, 16);
+    int vt = atoi(getAttr(head, "vtype").c_str());
+    ULONG vl = (ULONG)strtoul(getAttr(head, "vlen").c_str(), nullptr, 0);
+    if (vt < 0 || vt > 7) vt = V_U32;
+    if (!vl || vl > 32) vl = 4;
+    std::vector<PSPath> tmp;
+    size_t p = 0;
+    while ((p = data.find("<P ", p)) != std::string::npos) {
+        size_t q = data.find("/>", p);
+        if (q == std::string::npos) break;
+        std::string tag = data.substr(p, q - p);
+        p = q + 2;
+        PSPath e{};
+        e.mod = xml_unesc(getAttr(tag, "mod"));
+        if (e.mod.empty()) continue;
+        e.modOff = strtoull(getAttr(tag, "moff").c_str(), nullptr, 16);
+        e.nOff = atoi(getAttr(tag, "n").c_str());
+        if (e.nOff < 1 || e.nOff > PTR_MAX) continue;
+        std::string lo = getAttr(tag, "offs");
+        e.nOff = 0;
+        if (!lo.empty()) {
+            size_t s = 0;
+            while (s < lo.size() && e.nOff < PTR_MAX) {
+                size_t c = lo.find(',', s);
+                std::string one = (c == std::string::npos) ? lo.substr(s) : lo.substr(s, c - s);
+                e.offs[e.nOff++] = strtoull(one.c_str(), nullptr, 16);
+                if (c == std::string::npos) break;
+                s = c + 1;
+            }
+        }
+        if (!e.nOff) continue;
+        e.pointsTo = strtoull(getAttr(tag, "points").c_str(), nullptr, 16);
+        tmp.push_back(e);
+        if (tmp.size() >= 500000) break;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_psResMtx);
+        g_psRes.swap(tmp);
+    }
+    g_ps.target = target; g_ps.vtype = vt; g_ps.vlen = vl;
+    PS_RefreshResList();
+    char s[160]; snprintf(s, sizeof(s), "Loaded pointerlist: %zu paths (target %llX)", g_psRes.size(), (unsigned long long)target);
+    setStatus(s);
+    return true;
+}
 static void PS_SaveList(const char* path) {
     FILE* f = nullptr;
     fopen_s(&f, path, "wb");
@@ -1891,18 +1976,23 @@ static void PS_SaveList(const char* path) {
     setStatus(s);
 }
 // Resolve one saved path against CURRENT module bases (rebase-safe rescan)
+// CE semantic: p = base; for each off: p = *(p) + off.
 static bool PS_ResolveByName(const std::string& mod, UINT64 modOff, const UINT64* offs, int n, UINT64& out) {
     UINT64 base = 0;
     for (auto& m : g_mods) {
         if (_stricmp(m.name.c_str(), mod.c_str()) == 0 && m.size) { base = m.base + modOff; break; }
     }
     if (!base || !g_drv || !g_attached) return false;
+    if (!ls_driver::is_user_range(base, 8)) return false;
     UINT64 p = base;
     for (int i = 0; i < n && i < PTR_MAX; i++) {
         UINT64 v = 0;
-        g_drv->read_raw(p + offs[i], (BYTE*)&v, 8);
+        if (!g_drv->read_u64_checked(p, v)) return false;
         if (!v) return false;
-        p = v;
+        UINT64 nxt = v + offs[i];
+        if (nxt < v) return false;
+        if (!ls_driver::is_user_range(nxt, 1)) return false;
+        p = nxt;
     }
     out = p;
     return true;
@@ -2006,7 +2096,8 @@ static void PS_OpenResults() {
     c("BUTTON", "Rescan...", BS_PUSHBUTTON, 8, 420, 110, 28, PS_RESCAN);
     c("BUTTON", "Add Selected", BS_PUSHBUTTON, 128, 420, 110, 28, PS_ADD);
     c("BUTTON", "Save", BS_PUSHBUTTON, 248, 420, 90, 28, PS_SAVE);
-    c("BUTTON", "Close", BS_PUSHBUTTON, 348, 420, 90, 28, PS_CLOSEB);
+    c("BUTTON", "Open", BS_PUSHBUTTON, 348, 420, 90, 28, PS_OPENB);
+    c("BUTTON", "Close", BS_PUSHBUTTON, 448, 420, 90, 28, PS_CLOSEB);
     ShowWindow(p, SW_SHOW);
     PS_RefreshResList();
 }
@@ -2042,7 +2133,7 @@ static void PS_OpenRescan() {
     if (!g_attached) { setStatus("Attach first"); return; }
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
     char cur[32]; snprintf(cur, sizeof(cur), "%llX", (unsigned long long)g_ps.target);
-    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Rescan pointerlist", WS_POPUP | WS_CAPTION | WS_SYSMENU, 320, 220, 360, 170, g_psWin ? g_psWin : g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Rescan pointerlist", WS_POPUP | WS_CAPTION | WS_SYSMENU, 320, 220, 380, 200, g_psWin ? g_psWin : g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_dlg;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
         HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
@@ -2050,9 +2141,10 @@ static void PS_OpenRescan() {
         return h2;
     };
     c("STATIC", "Address to find:", SS_LEFT, 12, 14, 110, 20, -1);
-    c("EDIT", cur, WS_BORDER | ES_AUTOHSCROLL, 130, 12, 200, 24, PSR_ADDR);
-    c("BUTTON", "OK", BS_DEFPUSHBUTTON, 90, 60, 80, 28, DLG_OK_BTN);
-    c("BUTTON", "Cancel", BS_PUSHBUTTON, 190, 60, 80, 28, DLG_CANCEL_BTN);
+    c("EDIT", cur, WS_BORDER | ES_AUTOHSCROLL, 130, 12, 220, 24, PSR_ADDR);
+    c("BUTTON", "Only filter out invalid pointers", BS_AUTOCHECKBOX, 12, 46, 340, 22, PSR_VALID);
+    c("BUTTON", "OK", BS_DEFPUSHBUTTON, 100, 84, 80, 28, DLG_OK_BTN);
+    c("BUTTON", "Cancel", BS_PUSHBUTTON, 200, 84, 80, 28, DLG_CANCEL_BTN);
     SetWindowLongPtrA(p, GWLP_USERDATA, 8); // mode 8 = pointer rescan
     ShowWindow(p, SW_SHOW);
 }
@@ -2077,10 +2169,37 @@ static void PS_DoRescan(const std::string& txt) {
     PS_RefreshResList();
     char s[160]; snprintf(s, sizeof(s), "Rescan: %zu paths still point to %llX", g_psRes.size(), (unsigned long long)newT);
     setStatus(s);
-    // checkpoint again, like CE asks to save after rescan
+    // checkpoint again, like CE asks to save after rescan (.lps pointerlist)
     char path[MAX_PATH]{};
-    if (TableFileDlg(true, path, MAX_PATH)) {
-        // force .lps extension flavor
+    if (PS_FileDlg(true, path, MAX_PATH)) {
+        PS_SaveList(path);
+    }
+}
+// Valid-only rescan: no target address needed. Keeps paths that still resolve
+// to anything live, drops the ?? ones. Checkbox mode in the rescan dialog.
+static void PS_DoRescanValid() {
+    if (!g_attached || !g_drv) { setStatus("Attach first"); return; }
+    RefreshMods(g_pid); // current bases (post-restart ASLR)
+    size_t total = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_psResMtx);
+        total = g_psRes.size();
+        std::vector<PSPath> kept;
+        kept.reserve(total);
+        for (auto& p : g_psRes) {
+            UINT64 f = 0;
+            if (PS_ResolveByName(p.mod, p.modOff, p.offs, p.nOff, f)) {
+                p.pointsTo = f;
+                kept.push_back(p);
+            }
+        }
+        g_psRes.swap(kept);
+    }
+    PS_RefreshResList();
+    char s[160]; snprintf(s, sizeof(s), "Rescan: %zu live of %zu (invalid removed)", g_psRes.size(), total);
+    setStatus(s);
+    char path[MAX_PATH]{};
+    if (PS_FileDlg(true, path, MAX_PATH)) {
         PS_SaveList(path);
     }
 }
@@ -2144,7 +2263,15 @@ static LRESULT CALLBACK PSResProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (id == PS_RESCAN) { PS_OpenRescan(); return 0; }
         if (id == PS_SAVE) {
             char path[MAX_PATH]{};
-            if (TableFileDlg(true, path, MAX_PATH)) PS_SaveList(path);
+            if (PS_FileDlg(true, path, MAX_PATH)) PS_SaveList(path);
+            return 0;
+        }
+        if (id == PS_OPENB) {
+            char path[MAX_PATH]{};
+            if (PS_FileDlg(false, path, MAX_PATH)) {
+                if (!g_psWin) PS_OpenResults();
+                PS_LoadList(path);
+            }
             return 0;
         }
         return 0;
@@ -2158,6 +2285,26 @@ static LRESULT CALLBACK PSResProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     if (m == WM_CLOSE) { DestroyWindow(h); return 0; }
     if (m == WM_DESTROY) { if (h == g_psWin) g_psWin = nullptr; return 0; }
+    if (m == WM_GETMINMAXINFO) {
+        LPMINMAXINFO mm = (LPMINMAXINFO)l;
+        mm->ptMinTrackSize.x = 500;
+        mm->ptMinTrackSize.y = 300;
+        return 0;
+    }
+    if (m == WM_SIZE) {
+        // Keep list filling the window + buttons anchored bottom-left (maximize-safe)
+        int cw = LOWORD(l), ch = HIWORD(l);
+        HWND lv = GetDlgItem(h, PS_RES_LIST);
+        if (lv) SetWindowPos(lv, nullptr, 8, 8, (std::max)(cw - 16, 100), (std::max)(ch - 60, 80), SWP_NOZORDER);
+        int by = (std::max)(ch - 40, 90);
+        const int bx[] = { 8, 128, 248, 348, 448 };
+        const int bid[] = { PS_RESCAN, PS_ADD, PS_SAVE, PS_OPENB, PS_CLOSEB };
+        for (int i = 0; i < 5; i++) {
+            HWND b = GetDlgItem(h, bid[i]);
+            if (b) SetWindowPos(b, nullptr, bx[i], by, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        }
+        return 0;
+    }
     return DefWindowProcA(h, m, w, l);
 }
 
@@ -2199,6 +2346,12 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 updateManualPreview(h);
                 return 0;
             }
+        }
+        if (mode0 == 8 && id == PSR_VALID && code == BN_CLICKED) {
+            // valid-only ticked => address box irrelevant: disable it
+            bool on = SendMessageA(GetDlgItem(h, PSR_VALID), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            EnableWindow(GetDlgItem(h, PSR_ADDR), on ? FALSE : TRUE);
+            return 0;
         }
         if (id == DLG_CANCEL_BTN) { DestroyWindow(h); return 0; }
         if (id == DLG_OK_BTN) {
@@ -2303,10 +2456,12 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 return 0;
             }
             if (mode == 8) {
-                // Pointer rescan: filter to new target, then checkpoint-save again
+                // Pointer rescan: new-target filter, or valid-only when checkbox ticked
+                bool validOnly = SendMessageA(GetDlgItem(h, PSR_VALID), BM_GETCHECK, 0, 0) == BST_CHECKED;
                 std::string t = dlgText(h, PSR_ADDR);
                 DestroyWindow(h);
-                PS_DoRescan(t);
+                if (validOnly) PS_DoRescanValid();
+                else PS_DoRescan(t);
                 return 0;
             }
             if (mode == 5) {
@@ -2584,6 +2739,7 @@ static HMENU BuildMenu() {
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)s, "Scan");
     HMENU v = CreatePopupMenu();
     AppendMenuA(v, MF_STRING, 9007, "Memory View");
+    AppendMenuA(v, MF_STRING, 9014, "Pointer Scan");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)v, "View");
     AppendMenuA(bar, MF_STRING, 9012, "Settings");
     HMENU h = CreatePopupMenu();
@@ -2695,6 +2851,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else setStatus("Nothing to undo");
         }
         else if (id == IDC_MEMVIEW_BTN || id == 9007) OpenMemView();
+        else if (id == 9014) PS_OpenResults(); // View -> Pointer Scan (blank list, can Open .lps)
         else if (id == 9012) OpenSettings();
         else if (id == IDC_ADDADDR_BTN) doAddSelectedToTable();
         else if (id == IDC_VTYPE_CB && code == CBN_SELCHANGE) {
