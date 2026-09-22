@@ -268,6 +268,7 @@ enum {
     PL_LIST = 1010, PL_REFRESH, PL_EDIT,
     // table/found context menu
     CTX_DEL = 9110, CTX_VAL, CTX_TYPE, CTX_DESC, CTX_ADDR, CTX_ADD, CTX_PS,
+    CTX_COPY_ASIS, CTX_COPY_MOD, CTX_DISM,
     // pointer scan windows
     PS_PROG_STAT = 1060, PS_STOP,
     PS_RES_LIST = 1062, PS_RESCAN, PS_ADD, PS_SAVE, PS_CLOSEB, PS_OPENB,
@@ -276,7 +277,8 @@ enum {
     // settings dialog
     SET_MODCHK = 1040,
     // mem viewer popup
-    MV_X = 1100, MV_ADDR_EDIT, MV_SIZE_EDIT, MV_DUMP_BTN, MV_WRITE_EDIT, MV_WRITE_BTN, MV_HEX_EDIT
+    MV_X = 1100, MV_ADDR_EDIT, MV_SIZE_EDIT, MV_DUMP_BTN, MV_WRITE_EDIT, MV_WRITE_BTN, MV_HEX_EDIT,
+    MV_DIS_LIST, MV_DIS_BTN,
 };
 static HWND g_ctl[1200]{};
 static HWND ctl(int id) { return (id >= 0 && id < 1200) ? g_ctl[id] : nullptr; }
@@ -1567,26 +1569,488 @@ static void OpenChangeDesc(const TblEntry& e) {
     SendMessageA(eb, EM_SETSEL, 0, -1);
     SetFocus(eb);
 }
-// Memory viewer popup
+//=================================================================
+//  x64 disassembler (64-bit mode, common subset) + single-line assembler
+//  Unknown bytes fall back to `db XX`. Assembler numbers are HEX by
+//  default (CE-style: `28` = 0x28, `0x28` and `28h` also accepted).
+//=================================================================
+static std::string xa_rname(int code, int ext, int bits, bool hasRex) {
+    int r = (code & 7) | (ext ? 8 : 0);
+    static const char* q[] = { "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15" };
+    static const char* d[] = { "eax","ecx","edx","ebx","esp","ebp","esi","edi","r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d" };
+    static const char* w[] = { "ax","cx","dx","bx","sp","bp","si","di","r8w","r9w","r10w","r11w","r12w","r13w","r14w","r15w" };
+    static const char* bl[] = { "al","cl","dl","bl","spl","bpl","sil","dil","r8b","r9b","r10b","r11b","r12b","r13b","r14b","r15b" };
+    static const char* bh[] = { "al","cl","dl","bl","ah","ch","dh","bh" };
+    if (bits == 64) return q[r];
+    if (bits == 32) return d[r];
+    if (bits == 16) return w[r];
+    if (!hasRex && !ext && code >= 4) return bh[code & 7];
+    return bl[r];
+}
+// Decode r/m operand at c[pos] (modrm, 64-bit mode). Emits register name when
+// mod==3, else [mem]. Returns bytes consumed (0 = truncated). hasRex includes
+// any REX byte (for spl vs ah selection).
+static int xa_rm(const BYTE* c, int avail, int pos, int regBits, bool hasRex, bool rx, bool rb,
+    std::string& out, bool ripOk = true) {
+    if (pos >= avail) return 0;
+    int modrm = c[pos];
+    int mod = (modrm >> 6) & 3, rm = modrm & 7;
+    if (mod == 3) { out = xa_rname(rm, rb, regBits, hasRex); return 1; }
+    std::string mem;
+    int p = pos + 1;
+    int index = -1, ix = 0, scale = 1, base = -1, bx = 0;
+    bool noBase = false;
+    if ((rm & 7) == 4) {
+        if (p >= avail) return 0;
+        int sib = c[p++];
+        scale = 1 << ((sib >> 6) & 3);
+        int idx = (sib >> 3) & 7;
+        base = sib & 7;
+        if (idx == 4) index = -1; else { index = idx; ix = rx ? 1 : 0; }
+        if (base == 5 && mod == 0) { noBase = true; }
+        else { bx = rb ? 1 : 0; }
+        if (noBase) base = -1;
+    }
+    else if (rm == 5 && mod == 0) {
+        // RIP-relative
+        if (p + 4 > avail) return 0;
+        int32_t d = 0; memcpy(&d, c + p, 4); p += 4;
+        char tb[160];
+        // setStatus-free helper: show module+off when inside a known module
+        bool shown = false;
+        if (ripOk) {
+            // target computed by caller (needs full len); show raw disp here,
+            // caller rewrites [rip+..] when it knows va+len. Keep simple text:
+            snprintf(tb, sizeof(tb), "[rip+0x%X]", (unsigned)d);
+            shown = true;
+        }
+        if (shown) { out = tb; return p - pos; }
+        out = "[rip]";
+        return p - pos;
+    }
+    else { base = rm; bx = rb ? 1 : 0; }
+    int64_t disp = 0; int dispSz = 0;
+    if (mod == 1) { if (p >= avail) return 0; disp = (int8_t)c[p++]; dispSz = 1; }
+    else if (mod == 2 || noBase) { if (p + 4 > avail) return 0; int32_t d = 0; memcpy(&d, c + p, 4); p += 4; disp = d; dispSz = 4; }
+    char mb[128]{};
+    if (base < 0 && index < 0) snprintf(mb, sizeof(mb), "[0x%llX]", (unsigned long long)(uint32_t)disp);
+    else if (base < 0) snprintf(mb, sizeof(mb), "[%s*%d+0x%llX]", xa_rname(index, ix, 64, true).c_str(), scale, (unsigned long long)(uint32_t)disp);
+    else {
+        std::string b = xa_rname(base, bx, 64, true);
+        if (index >= 0) {
+            char ib[64]; snprintf(ib, sizeof(ib), "+%s*%d", xa_rname(index, ix, 64, true).c_str(), scale);
+            if (!disp) snprintf(mb, sizeof(mb), "[%s%s]", b.c_str(), ib);
+            else if (disp > 0) snprintf(mb, sizeof(mb), "[%s%s+0x%llX]", b.c_str(), ib, (unsigned long long)disp);
+            else snprintf(mb, sizeof(mb), "[%s%s-0x%llX]", b.c_str(), ib, (unsigned long long)-disp);
+        }
+        else {
+            if (!disp) snprintf(mb, sizeof(mb), "[%s]", b.c_str());
+            else if (disp > 0) snprintf(mb, sizeof(mb), "[%s+0x%llX]", b.c_str(), (unsigned long long)disp);
+            else snprintf(mb, sizeof(mb), "[%s-0x%llX]", b.c_str(), (unsigned long long)-disp);
+        }
+    }
+    (void)dispSz;
+    out = mb;
+    return p - pos;
+}
+// Target address display: "mod"+OFF when inside a known module, else hex.
+static std::string xa_target(UINT64 t) {
+    char b[160];
+    for (auto& m : g_mods) {
+        if (m.size && t >= m.base && t < m.base + m.size) {
+            snprintf(b, sizeof(b), "\"%s\"+%llX", m.name.c_str(), (unsigned long long)(t - m.base));
+            return b;
+        }
+    }
+    snprintf(b, sizeof(b), "%llX", (unsigned long long)t);
+    return b;
+}
+// Decode one instruction. Returns length (>=1). ops = "mnemonic operands".
+static int xa_decode(const BYTE* c, int avail, UINT64 va, std::string& ops) {
+    ops.clear();
+    if (avail <= 0) return 0;
+    int pos = 0;
+    bool hasRex = false, w = false, rr = false, rx = false, rb = false, op16 = false;
+    int pfxStart = 0;
+    for (;;) {
+        if (pos >= avail) break;
+        BYTE b = c[pos];
+        if (b >= 0x40 && b <= 0x4F) { hasRex = true; w = (b & 8) != 0; rr = (b & 4) != 0; rx = (b & 2) != 0; rb = (b & 1) != 0; pos++; }
+        else if (b == 0x66) { op16 = true; pos++; }
+        else if (b == 0xF0 || b == 0xF2 || b == 0xF3 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 || b == 0x65 || b == 0x67) pos++;
+        else break;
+        if (pos - pfxStart > 5) break;
+    }
+    if (pos >= avail) { ops = "db"; return avail; }
+    int obits = w ? 64 : (op16 ? 16 : 32);
+    BYTE op = c[pos++];
+    bool esc = false; BYTE op2 = 0;
+    if (op == 0x0F) {
+        if (pos >= avail) { ops = "db 0F"; return pos; }
+        op2 = c[pos++]; esc = true;
+    }
+    char tmp[160]{};
+    std::string rm, rg;
+    int cons = 0;
+    auto need = [&](int n) { return pos + n <= avail; };
+    static const char* alu[] = { "add","or","adc","sbb","and","sub","xor","cmp" };
+    static const char* shf[] = { "rol","ror","rcl","rcr","shl","shr","sal","sar" };
+    static const char* jcc[] = { "jo","jno","jb","jae","je","jne","jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg" };
+    if (!esc) {
+        if ((op & 0xF8) == 0x50) { snprintf(tmp, sizeof(tmp), "push %s", xa_rname(op & 7, rb, w ? 64 : (op16 ? 16 : 64), hasRex).c_str()); ops = tmp; return pos; }
+        if ((op & 0xF8) == 0x58) { snprintf(tmp, sizeof(tmp), "pop %s", xa_rname(op & 7, rb, w ? 64 : (op16 ? 16 : 64), hasRex).c_str()); ops = tmp; return pos; }
+        if ((op & 0xF8) == 0x90) {
+            if (!hasRex && (op & 7) == 0) { ops = "nop"; return pos; }
+            snprintf(tmp, sizeof(tmp), "xchg %s, %s", xa_rname(0, false, obits, hasRex).c_str(), xa_rname(op & 7, rb, obits, hasRex).c_str());
+            ops = tmp; return pos;
+        }
+        if ((op & 0xF8) == 0xB8) {
+            int64_t im = 0; int isz = (obits == 64) ? 8 : (obits == 16 ? 2 : 4);
+            if (!need(isz)) goto db;
+            memcpy(&im, c + pos, isz); pos += isz;
+            if (obits == 64) snprintf(tmp, sizeof(tmp), "mov %s, 0x%llX", xa_rname(op & 7, rb, 64, hasRex).c_str(), (unsigned long long)im);
+            else snprintf(tmp, sizeof(tmp), "mov %s, 0x%llX", xa_rname(op & 7, rb, obits, hasRex).c_str(), (unsigned long long)(uint32_t)im);
+            ops = tmp; return pos;
+        }
+        if ((op & 0xF8) == 0xB0) {
+            if (!need(1)) goto db;
+            snprintf(tmp, sizeof(tmp), "mov %s, 0x%X", xa_rname(op & 7, rb, 8, hasRex).c_str(), c[pos++]);
+            ops = tmp; return pos;
+        }
+        if (op >= 0x70 && op <= 0x7F) {
+            if (!need(1)) goto db;
+            int8_t r = (int8_t)c[pos++];
+            snprintf(tmp, sizeof(tmp), "%s %s", jcc[op & 15], xa_target(va + pos + r).c_str());
+            ops = tmp; return pos;
+        }
+        switch (op) {
+        case 0x04: case 0x0C: case 0x14: case 0x1C: case 0x24: case 0x2C: case 0x34: case 0x3C:
+            if (!need(1)) goto db;
+            snprintf(tmp, sizeof(tmp), "%s al, 0x%X", alu[(op >> 3) & 7], c[pos++]);
+            ops = tmp; return pos;
+        case 0x05: case 0x0D: case 0x15: case 0x1D: case 0x25: case 0x2D: case 0x35: case 0x3D: {
+            int isz = (obits == 16) ? 2 : 4; if (!need(isz)) goto db;
+            uint32_t im = 0; memcpy(&im, c + pos, isz); pos += isz;
+            snprintf(tmp, sizeof(tmp), "%s %s, 0x%X", alu[(op >> 3) & 7], xa_rname(0, false, obits, hasRex).c_str(), im);
+            ops = tmp; return pos;
+        }
+        case 0x63: { // movsxd
+            if (pos >= avail) goto db;
+            int mod = (c[pos] >> 6) & 3, reg = (c[pos] >> 3) & 7;
+            cons = xa_rm(c, avail, pos, 32, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            if (mod == 3) { snprintf(tmp, sizeof(tmp), "movsxd %s, %s", xa_rname(reg, rr, w ? 64 : 32, hasRex).c_str(), rm.c_str()); }
+            else snprintf(tmp, sizeof(tmp), "movsxd %s, %s", xa_rname(reg, rr, w ? 64 : 32, hasRex).c_str(), rm.c_str());
+            ops = tmp; return pos;
+        }
+        case 0x68: { int isz = (obits == 16) ? 2 : 4; if (!need(isz)) goto db; uint32_t im = 0; memcpy(&im, c + pos, isz); pos += isz; snprintf(tmp, sizeof(tmp), "push 0x%X", im); ops = tmp; return pos; }
+        case 0x69: case 0x6B: {
+            if (pos >= avail) goto db;
+            int mod = (c[pos] >> 6) & 3, reg = (c[pos] >> 3) & 7;
+            cons = xa_rm(c, avail, pos, obits, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            int isz = (op == 0x6B) ? 1 : ((obits == 16) ? 2 : 4);
+            if (!need(isz)) goto db;
+            int64_t im = (isz == 1) ? (int8_t)c[pos] : 0;
+            if (isz > 1) { int32_t t = 0; memcpy(&t, c + pos, isz); im = t; }
+            pos += isz;
+            rg = xa_rname(reg, rr, obits, hasRex);
+            if (mod == 3) snprintf(tmp, sizeof(tmp), "imul %s, %s, 0x%llX", rg.c_str(), rm.c_str(), (unsigned long long)im);
+            else snprintf(tmp, sizeof(tmp), "imul %s, %s, 0x%llX", rg.c_str(), rm.c_str(), (unsigned long long)im);
+            ops = tmp; return pos;
+        }
+        case 0x80: case 0x82: case 0x81: case 0x83: {
+            if (pos >= avail) goto db;
+            int mod = (c[pos] >> 6) & 3, reg = (c[pos] >> 3) & 7;
+            int eb = (op == 0x80 || op == 0x82);
+            cons = xa_rm(c, avail, pos, eb ? 8 : obits, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            int isz = (op == 0x81) ? ((obits == 16) ? 2 : 4) : 1;
+            if (!need(isz)) goto db;
+            int64_t im = 0;
+            if (isz == 1) im = (op == 0x83) ? (int8_t)c[pos] : c[pos];
+            else { int32_t t = 0; memcpy(&t, c + pos, isz); im = (op == 0x83) ? (int8_t)c[pos] : t; }
+            pos += isz;
+            if (mod == 3) snprintf(tmp, sizeof(tmp), "%s %s, 0x%llX", alu[reg], rm.c_str(), (unsigned long long)im);
+            else snprintf(tmp, sizeof(tmp), "%s %s, 0x%llX", alu[reg], rm.c_str(), (unsigned long long)im);
+            ops = tmp; return pos;
+        }
+        case 0x84: case 0x85: case 0x86: case 0x87: {
+            if (pos >= avail) goto db;
+            int reg = (c[pos] >> 3) & 7;
+            int b = (op == 0x84 || op == 0x86) ? 8 : obits;
+            cons = xa_rm(c, avail, pos, b, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            const char* mn = (op == 0x84 || op == 0x85) ? "test" : "xchg";
+            rg = xa_rname(reg, rr, b, hasRex);
+            snprintf(tmp, sizeof(tmp), "%s %s, %s", mn, rm.c_str(), rg.c_str());
+            ops = tmp; return pos;
+        }
+        case 0x88: case 0x89: case 0x8A: case 0x8B: {
+            if (pos >= avail) goto db;
+            int reg = (c[pos] >> 3) & 7;
+            int b = (op == 0x88 || op == 0x8A) ? 8 : obits;
+            cons = xa_rm(c, avail, pos, b, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            rg = xa_rname(reg, rr, b, hasRex);
+            if (op == 0x88 || op == 0x89) snprintf(tmp, sizeof(tmp), "mov %s, %s", rm.c_str(), rg.c_str());
+            else snprintf(tmp, sizeof(tmp), "mov %s, %s", rg.c_str(), rm.c_str());
+            ops = tmp; return pos;
+        }
+        case 0x8D: {
+            if (pos >= avail) goto db;
+            if (((c[pos] >> 6) & 3) == 3) goto db;
+            int reg = (c[pos] >> 3) & 7;
+            cons = xa_rm(c, avail, pos, 8, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            snprintf(tmp, sizeof(tmp), "lea %s, %s", xa_rname(reg, rr, obits, hasRex).c_str(), rm.c_str());
+            ops = tmp; return pos;
+        }
+        case 0x8F: {
+            if (pos >= avail) goto db;
+            if (((c[pos] >> 3) & 7) != 0) goto db;
+            cons = xa_rm(c, avail, pos, obits, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            snprintf(tmp, sizeof(tmp), "pop %s", rm.c_str());
+            ops = tmp; return pos;
+        }
+        case 0x98: ops = w ? "cdqe" : (op16 ? "cbw" : "cwde"); return pos;
+        case 0x99: ops = w ? "cqo" : (op16 ? "cwd" : "cdq"); return pos;
+        case 0xA0: case 0xA1: case 0xA2: case 0xA3: {
+            int asz = 4; // disp size (ignore 0x67 nuance, assume 32-bit addr)
+            if (!need(asz)) goto db;
+            uint32_t am = 0; memcpy(&am, c + pos, 4); pos += asz;
+            rg = xa_rname(0, false, (op == 0xA0 || op == 0xA2) ? 8 : obits, hasRex);
+            if (op == 0xA0 || op == 0xA1) snprintf(tmp, sizeof(tmp), "mov %s, [0x%X]", rg.c_str(), am);
+            else snprintf(tmp, sizeof(tmp), "mov [0x%X], %s", am, rg.c_str());
+            ops = tmp; return pos;
+        }
+        case 0xA8: if (!need(1)) goto db; snprintf(tmp, sizeof(tmp), "test al, 0x%X", c[pos++]); ops = tmp; return pos;
+        case 0xA9: { int isz = (obits == 16) ? 2 : 4; if (!need(isz)) goto db; uint32_t im = 0; memcpy(&im, c + pos, isz); pos += isz; snprintf(tmp, sizeof(tmp), "test %s, 0x%X", xa_rname(0, false, obits, hasRex).c_str(), im); ops = tmp; return pos; }
+        case 0xC2: if (!need(2)) goto db; { uint16_t im = 0; memcpy(&im, c + pos, 2); pos += 2; snprintf(tmp, sizeof(tmp), "ret 0x%X", im); } ops = tmp; return pos;
+        case 0xC3: ops = "ret"; return pos;
+        case 0xC6: case 0xC7: {
+            if (pos >= avail) goto db;
+            if (((c[pos] >> 3) & 7) != 0) goto db;
+            int eb = (op == 0xC6);
+            cons = xa_rm(c, avail, pos, eb ? 8 : obits, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            int isz = eb ? 1 : ((obits == 16) ? 2 : 4);
+            if (!need(isz)) goto db;
+            uint32_t im = 0; memcpy(&im, c + pos, isz); pos += isz;
+            snprintf(tmp, sizeof(tmp), "mov %s, 0x%X", rm.c_str(), im);
+            ops = tmp; return pos;
+        }
+        case 0xC8: if (!need(3)) goto db; { uint16_t iw = 0; memcpy(&iw, c + pos, 2); snprintf(tmp, sizeof(tmp), "enter 0x%X, 0x%X", iw, c[pos + 2]); pos += 3; } ops = tmp; return pos;
+        case 0xC9: ops = "leave"; return pos;
+        case 0xCC: ops = "int3"; return pos;
+        case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3: {
+            if (pos >= avail) goto db;
+            int reg = (c[pos] >> 3) & 7;
+            int eb = (op == 0xC0 || op == 0xD0 || op == 0xD2);
+            cons = xa_rm(c, avail, pos, eb ? 8 : obits, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            if (op == 0xC0 || op == 0xC1) { if (!need(1)) goto db; snprintf(tmp, sizeof(tmp), "%s %s, 0x%X", shf[reg], rm.c_str(), c[pos++]); }
+            else if (op == 0xD0 || op == 0xD1) snprintf(tmp, sizeof(tmp), "%s %s, 1", shf[reg], rm.c_str());
+            else snprintf(tmp, sizeof(tmp), "%s %s, cl", shf[reg], rm.c_str());
+            ops = tmp; return pos;
+        }
+        case 0xE3: if (!need(1)) goto db; { int8_t r = (int8_t)c[pos++]; snprintf(tmp, sizeof(tmp), "jrcxz %s", xa_target(va + pos + r).c_str()); } ops = tmp; return pos;
+        case 0xE8: if (!need(4)) goto db; { int32_t r = 0; memcpy(&r, c + pos, 4); pos += 4; snprintf(tmp, sizeof(tmp), "call %s", xa_target(va + pos + r).c_str()); } ops = tmp; return pos;
+        case 0xE9: if (!need(4)) goto db; { int32_t r = 0; memcpy(&r, c + pos, 4); pos += 4; snprintf(tmp, sizeof(tmp), "jmp %s", xa_target(va + pos + r).c_str()); } ops = tmp; return pos;
+        case 0xEB: if (!need(1)) goto db; { int8_t r = (int8_t)c[pos++]; snprintf(tmp, sizeof(tmp), "jmp %s", xa_target(va + pos + r).c_str()); } ops = tmp; return pos;
+        case 0xF6: case 0xF7: {
+            if (pos >= avail) goto db;
+            int reg = (c[pos] >> 3) & 7;
+            if (reg != 0 && reg != 2 && reg != 3 && reg != 4 && reg != 5 && reg != 6 && reg != 7) goto db;
+            static const char* fn[] = { "test", "test", "not", "neg", "mul", "imul", "div", "idiv" };
+            int eb = (op == 0xF6);
+            cons = xa_rm(c, avail, pos, eb ? 8 : obits, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            if (reg == 0) {
+                int isz = eb ? 1 : ((obits == 16) ? 2 : 4);
+                if (!need(isz)) goto db;
+                uint32_t im = 0; memcpy(&im, c + pos, isz); pos += isz;
+                snprintf(tmp, sizeof(tmp), "test %s, 0x%X", rm.c_str(), im);
+            }
+            else snprintf(tmp, sizeof(tmp), "%s %s", fn[reg], rm.c_str());
+            ops = tmp; return pos;
+        }
+        case 0xFE: case 0xFF: {
+            if (pos >= avail) goto db;
+            int reg = (c[pos] >> 3) & 7;
+            static const char* fn[] = { "inc", "dec", "call", "callf", "jmp", "jmpf", "push", "??" };
+            if (op == 0xFE && reg > 1) goto db;
+            if (op == 0xFF && (reg == 3 || reg == 5 || reg == 7)) goto db;
+            int eb = (op == 0xFE);
+            cons = xa_rm(c, avail, pos, eb ? 8 : ((op == 0xFF && reg == 6) ? (w ? 64 : (op16 ? 16 : 64)) : obits), hasRex, rr, rb, rm);
+            if (!cons) goto db; pos += cons;
+            // rewrite call/jmp target when it's a rip-relative mem (nice CE touch)
+            if (!eb && (reg == 2 || reg == 4) && rm.rfind("[rip+", 0) == 0) {
+                // resolve [rip+disp] -> pointer value -> show it
+                unsigned d = 0;
+                if (sscanf_s(rm.c_str(), "[rip+0x%X]", &d) == 1) {
+                    UINT64 slot = va + pos + (int32_t)d;
+                    UINT64 pv = 0;
+                    if (g_drv && g_attached) g_drv->read_raw(slot, (BYTE*)&pv, 8);
+                    if (pv) snprintf(tmp, sizeof(tmp), "%s %s ; -> %s", fn[reg], rm.c_str(), xa_target(pv).c_str());
+                    else snprintf(tmp, sizeof(tmp), "%s %s", fn[reg], rm.c_str());
+                    ops = tmp; return pos;
+                }
+            }
+            snprintf(tmp, sizeof(tmp), "%s %s", fn[reg], rm.c_str());
+            ops = tmp; return pos;
+        }
+        default: goto db;
+        }
+    }
+    else {
+        // two-byte opcodes
+        if (op2 >= 0x80 && op2 <= 0x8F) {
+            if (!need(4)) goto db;
+            int32_t r = 0; memcpy(&r, c + pos, 4); pos += 4;
+            snprintf(tmp, sizeof(tmp), "%s %s", jcc[op2 & 15], xa_target(va + pos + r).c_str());
+            ops = tmp; return pos;
+        }
+        switch (op2) {
+        case 0x05: ops = "syscall"; return pos;
+        case 0x0B: ops = "ud2"; return pos;
+        case 0x1F: {
+            if (pos >= avail) goto db;
+            if (((c[pos] >> 3) & 7) != 0) goto db;
+            cons = xa_rm(c, avail, pos, obits, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            snprintf(tmp, sizeof(tmp), "nop %s", rm.c_str());
+            ops = tmp; return pos;
+        }
+        case 0x31: ops = "rdtsc"; return pos;
+        case 0xA2: ops = "cpuid"; return pos;
+        case 0xAF: case 0xBC: case 0xBD: {
+            if (pos >= avail) goto db;
+            int reg = (c[pos] >> 3) & 7;
+            cons = xa_rm(c, avail, pos, obits, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            const char* mn = (op2 == 0xAF) ? "imul" : (op2 == 0xBC ? "bsf" : "bsr");
+            snprintf(tmp, sizeof(tmp), "%s %s, %s", mn, xa_rname(reg, rr, obits, hasRex).c_str(), rm.c_str());
+            ops = tmp; return pos;
+        }
+        case 0xB6: case 0xB7: case 0xBE: case 0xBF: {
+            if (pos >= avail) goto db;
+            int reg = (c[pos] >> 3) & 7;
+            int eb = (op2 == 0xB6 || op2 == 0xBE);
+            cons = xa_rm(c, avail, pos, eb ? 8 : 16, hasRex, rr, rb, rm); if (!cons) goto db; pos += cons;
+            const char* mn = (op2 == 0xB6 || op2 == 0xB7) ? "movzx" : "movsx";
+            snprintf(tmp, sizeof(tmp), "%s %s, %s", mn, xa_rname(reg, rr, obits, hasRex).c_str(), rm.c_str());
+            ops = tmp; return pos;
+        }
+        default: goto db;
+        }
+    }
+db: {
+    char b[64]{}, *q = b;
+    int n = (std::min)(pos - pfxStart, 8);
+    if (n <= 0) n = 1;
+    for (int i = 0; i < n; i++) q += snprintf(q, sizeof(b) - (q - b), "%s0x%02X", i ? " " : "db ", c[pfxStart + i]);
+    ops = b;
+    return pfxStart + ((pos - pfxStart > 0) ? 1 : 1);
+}
+}
+// Memory viewer popup — CE style: disassembly on top, hex dump below.
+// Double-click an opcode row -> single-line assembler for that address.
+static void doMemDump(); // fwd: defined below OpenMemView
+static std::vector<UINT64> g_disAddr;
+static std::vector<std::string> g_disText;
+static std::vector<int> g_disLen;
+static UINT64 g_asmAddr = 0;
+static UINT64 g_mvGoAddr = 0; // Go-to-Dism pending address (consumed by OpenMemView)
+static void doMemDisasm() {
+    HWND lv = g_mv ? GetDlgItem(g_mv, MV_DIS_LIST) : nullptr;
+    if (!lv) return;
+    SendMessageA(lv, LVM_DELETEALLITEMS, 0, 0);
+    g_disAddr.clear(); g_disText.clear(); g_disLen.clear();
+    if (!g_drv || !g_attached) return;
+    UINT64 addr = strtoull(dlgText(g_mv, MV_ADDR_EDIT).c_str(), nullptr, 16);
+    if (!addr) return;
+    const SIZE_T kRead = 512;
+    std::vector<BYTE> buf(kRead);
+    g_drv->read_raw(addr, buf.data(), kRead);
+    LVITEMA it{}; it.mask = LVIF_TEXT;
+    char a[32], bs[64];
+    int zeros = 0;
+    for (SIZE_T off = 0; off < kRead && g_disAddr.size() < 64;) {
+        if (off + 16 <= kRead) {
+            bool all0 = true;
+            for (int i = 0; i < 16; i++) if (buf[off + i]) { all0 = false; break; }
+            if (all0) { zeros++; if (zeros >= 1) break; }
+            else zeros = 0;
+        }
+        std::string ops;
+        int len = xa_decode(buf.data() + off, (int)(kRead - off), addr + off, ops);
+        if (len <= 0) len = 1;
+        if ((SIZE_T)len > kRead - off) len = (int)(kRead - off);
+        char* q = bs;
+        for (int i = 0; i < len && i < 10; i++) q += snprintf(q, sizeof(bs) - (q - bs), "%02X ", buf[off + i]);
+        snprintf(a, sizeof(a), "%llX", (unsigned long long)(addr + off));
+        int row = (int)g_disAddr.size();
+        g_disAddr.push_back(addr + off); g_disText.push_back(ops); g_disLen.push_back(len);
+        it.iItem = row; it.iSubItem = 0; it.pszText = a;
+        SendMessageA(lv, LVM_INSERTITEMA, 0, (LPARAM)&it);
+        lv_set_text(lv, row, 1, bs);
+        lv_set_text(lv, row, 2, (LPSTR)ops.c_str());
+        off += (SIZE_T)len;
+    }
+}
+static void OpenAsmDialog(UINT64 addr, const char* curText) {
+    if (g_dlg) { SetForegroundWindow(g_dlg); return; }
+    g_asmAddr = addr;
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Assemble", WS_POPUP | WS_CAPTION | WS_SYSMENU, 300, 250, 420, 190, g_mv ? g_mv : g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    HWND p = g_dlg;
+    auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
+        HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
+        if (g_fUI) SendMessageA(h2, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+        return h2;
+    };
+    c("STATIC", "Type your assembler code here:", SS_LEFT, 12, 12, 380, 20, -1);
+    char al[64]; snprintf(al, sizeof(al), "(address=%llX)", (unsigned long long)addr);
+    c("STATIC", al, SS_LEFT, 12, 34, 380, 20, -1);
+    c("EDIT", curText ? curText : "", WS_BORDER | ES_AUTOHSCROLL, 12, 58, 380, 24, DLG_VAL_EDIT);
+    c("BUTTON", "OK", BS_DEFPUSHBUTTON, 110, 100, 80, 28, DLG_OK_BTN);
+    c("BUTTON", "Cancel", BS_PUSHBUTTON, 210, 100, 80, 28, DLG_CANCEL_BTN);
+    SetWindowLongPtrA(p, GWLP_USERDATA, 9); // mode 9 = single-line assembler
+    ShowWindow(p, SW_SHOW);
+    HWND eb = GetDlgItem(p, DLG_VAL_EDIT);
+    SendMessageA(eb, EM_SETSEL, 0, -1);
+    SetFocus(eb);
+}
 static void OpenMemView() {
     if (g_mv) { SetForegroundWindow(g_mv); return; }
-    g_mv = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsMem, "System Settings", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, 200, 150, 640, 480, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_mv = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsMem, "System Settings", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX, 200, 150, 760, 520, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
     HWND p = g_mv;
     auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
         HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
         if (g_fUI) SendMessageA(h2, WM_SETFONT, (WPARAM)g_fUI, TRUE);
         return h2;
     };
+    // prefill address: Go-to-Dism override wins, else selected table row (CE habit)
+    char preAddr[32]{}; snprintf(preAddr, sizeof(preAddr), "0");
+    if (g_mvGoAddr) snprintf(preAddr, sizeof(preAddr), "%llX", (unsigned long long)g_mvGoAddr);
+    else {
+        HWND tv = ctl(IDC_TBL_LIST);
+        int sel = tv ? ListView_GetNextItem(tv, -1, LVNI_SELECTED) : -1;
+        if (sel >= 0) {
+            TblEntry e; bool got = false;
+            { std::lock_guard<std::mutex> lk(g_tableMtx); if ((size_t)sel < g_table.size()) { e = g_table[(size_t)sel]; got = true; } }
+            if (got) { UINT64 f = e.addr; if (g_drv && g_attached && entry_final(e, f)) snprintf(preAddr, sizeof(preAddr), "%llX", (unsigned long long)f); }
+        }
+    }
     c("STATIC", "Address:", SS_LEFT, 12, 12, 60, 20, -1);
-    c("EDIT", "0", WS_BORDER | ES_AUTOHSCROLL, 75, 10, 150, 24, MV_ADDR_EDIT);
+    c("EDIT", preAddr, WS_BORDER | ES_AUTOHSCROLL, 75, 10, 150, 24, MV_ADDR_EDIT);
     c("STATIC", "Size:", SS_LEFT, 235, 12, 35, 20, -1);
     c("EDIT", "256", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 275, 10, 60, 24, MV_SIZE_EDIT);
     c("BUTTON", "Dump", BS_PUSHBUTTON, 345, 9, 70, 26, MV_DUMP_BTN);
-    c("EDIT", "90 90 90", WS_BORDER | ES_AUTOHSCROLL, 425, 10, 120, 24, MV_WRITE_EDIT);
-    c("BUTTON", "Write", BS_PUSHBUTTON, 550, 9, 70, 26, MV_WRITE_BTN);
-    HWND hex = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "Attach first, set address, Dump.", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY, 12, 44, 600, 390, p, (HMENU)(INT_PTR)MV_HEX_EDIT, GetModuleHandleA(nullptr), nullptr);
+    c("BUTTON", "Disasm", BS_PUSHBUTTON, 420, 9, 70, 26, MV_DIS_BTN);
+    c("EDIT", "90 90 90", WS_BORDER | ES_AUTOHSCROLL, 495, 10, 150, 24, MV_WRITE_EDIT);
+    c("BUTTON", "Write", BS_PUSHBUTTON, 650, 9, 80, 26, MV_WRITE_BTN);
+    HWND lv = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 12, 44, 720, 190, p, (HMENU)(INT_PTR)MV_DIS_LIST, GetModuleHandleA(nullptr), nullptr);
+    ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    {
+        const char* n[] = { "Address", "Bytes", "Opcode" };
+        int w[] = { 150, 200, 360 };
+        lv_cols(lv, n, w, 3);
+    }
+    HWND hex = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "Attach first, set address, Dump.", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY, 12, 240, 720, 228, p, (HMENU)(INT_PTR)MV_HEX_EDIT, GetModuleHandleA(nullptr), nullptr);
     (void)hex;
     ShowWindow(p, SW_SHOW);
+    doMemDump();
+    doMemDisasm();
 }
 static void doMemDump() {
     if (!g_mv) return;
@@ -1640,6 +2104,507 @@ static void doMemWrite() {
         SetDlgItemTextA(g_mv, MV_HEX_EDIT, memcmp(chk, bytes.data(), bytes.size()) == 0 ? "Write OK (verified)." : "Write verify FAILED.");
     }
     else SetDlgItemTextA(g_mv, MV_HEX_EDIT, "Write FAILED.");
+}
+//=================================================================
+//  Single-line assembler (pairs with xa_decode above)
+//=================================================================
+struct AsmReg { int code = 0, ext = 0, bits = 0, fr = 0; }; // fr = forces REX (spl/bpl/sil/dil)
+static bool asm_reg(const char* t, AsmReg& r) {
+    char b[16]{}; size_t n = strlen(t);
+    if (!n || n > 4) return false;
+    for (size_t i = 0; i < n && i < 15; i++) b[i] = (char)tolower((unsigned char)t[i]);
+    static const struct { const char* n; int c; int e; int w; } tab[] = {
+        {"al",0,0,8},{"cl",1,0,8},{"dl",2,0,8},{"bl",3,0,8},{"spl",4,0,8},{"bpl",5,0,8},{"sil",6,0,8},{"dil",7,0,8},
+        {"r8b",0,1,8},{"r9b",1,1,8},{"r10b",2,1,8},{"r11b",3,1,8},{"r12b",4,1,8},{"r13b",5,1,8},{"r14b",6,1,8},{"r15b",7,1,8},
+        {"ah",4,0,-8},{"ch",5,0,-8},{"dh",6,0,-8},{"bh",7,0,-8},
+        {"ax",0,0,16},{"cx",1,0,16},{"dx",2,0,16},{"bx",3,0,16},{"sp",4,0,16},{"bp",5,0,16},{"si",6,0,16},{"di",7,0,16},
+        {"r8w",0,1,16},{"r9w",1,1,16},{"r10w",2,1,16},{"r11w",3,1,16},{"r12w",4,1,16},{"r13w",5,1,16},{"r14w",6,1,16},{"r15w",7,1,16},
+        {"eax",0,0,32},{"ecx",1,0,32},{"edx",2,0,32},{"ebx",3,0,32},{"esp",4,0,32},{"ebp",5,0,32},{"esi",6,0,32},{"edi",7,0,32},
+        {"r8d",0,1,32},{"r9d",1,1,32},{"r10d",2,1,32},{"r11d",3,1,32},{"r12d",4,1,32},{"r13d",5,1,32},{"r14d",6,1,32},{"r15d",7,1,32},
+        {"rax",0,0,64},{"rcx",1,0,64},{"rdx",2,0,64},{"rbx",3,0,64},{"rsp",4,0,64},{"rbp",5,0,64},{"rsi",6,0,64},{"rdi",7,0,64},
+        {"r8",0,1,64},{"r9",1,1,64},{"r10",2,1,64},{"r11",3,1,64},{"r12",4,1,64},{"r13",5,1,64},{"r14",6,1,64},{"r15",7,1,64},
+    };
+    for (auto& e : tab) if (strcmp(b, e.n) == 0) { r.code = e.c; r.ext = e.e; r.bits = e.w; r.fr = (strcmp(b, "spl") == 0 || strcmp(b, "bpl") == 0 || strcmp(b, "sil") == 0 || strcmp(b, "dil") == 0) ? 1 : 0; return true; }
+    return false;
+}
+// HEX by default (CE-style). Accepts 0x.., ..h, decimals only via 0d..? plain = hex.
+static bool asm_num(const char* t, int64_t& v) {
+    char b[64]{}; size_t n = strlen(t);
+    if (!n || n > 20) return false;
+    for (size_t i = 0; i < n && i < 63; i++) b[i] = (char)tolower((unsigned char)t[i]);
+    int neg = 0; const char* s = b;
+    if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
+    int base = 16; size_t L = strlen(s);
+    if (L > 2 && s[0] == '0' && s[1] == 'x') { s += 2; }
+    else if (L && s[L - 1] == 'h') { char c2[64]{}; memcpy(c2, s, L - 1); strcpy_s(b, sizeof(b), neg ? "-" : ""); strcat_s(b, sizeof(b), c2); s = b + (neg ? 1 : 0); }
+    if (!*s) return false;
+    for (const char* p = s; *p; p++) if (!isxdigit((unsigned char)*p)) return false;
+    v = (int64_t)strtoull(s, nullptr, base);
+    if (neg) v = -v;
+    return true;
+}
+struct AsmMem { bool rip = false; int base = -1, bExt = 0, index = -1, iExt = 0, scale = 1; int64_t disp = 0; bool hasDisp = false; };
+static bool asm_mem(const char* t, AsmMem& m) {
+    m = AsmMem{};
+    std::string s = t;
+    std::string ns;
+    for (char c : s) if (!isspace((unsigned char)c)) ns += (char)tolower((unsigned char)c);
+    if (ns.size() < 3 || ns.front() != '[' || ns.back() != ']') return false;
+    std::string inner = ns.substr(1, ns.size() - 2);
+    if (inner.empty()) return false;
+    // split on +/- keeping sign
+    std::vector<std::pair<char, std::string>> toks;
+    std::string cur; char sign = '+';
+    for (char c : inner) {
+        if (c == '+' || c == '-') { if (!cur.empty()) { toks.push_back({ sign, cur }); cur.clear(); } sign = c; }
+        else cur += c;
+    }
+    if (!cur.empty()) toks.push_back({ sign, cur });
+    int regs = 0;
+    for (auto& tk : toks) {
+        std::string tok = tk.second;
+        size_t star = tok.find('*');
+        if (tok == "rip") { m.rip = true; continue; }
+        if (star != std::string::npos) {
+            std::string rs = tok.substr(0, star), ss = tok.substr(star + 1);
+            AsmReg r{};
+            int sc = atoi(ss.c_str());
+            if (!asm_reg(rs.c_str(), r) || (sc != 1 && sc != 2 && sc != 4 && sc != 8)) return false;
+            if (m.index >= 0) return false;
+            m.index = r.code; m.iExt = r.ext; m.scale = sc; regs++;
+            continue;
+        }
+        AsmReg r{};
+        if (asm_reg(tok.c_str(), r)) {
+            if (r.bits == 8 || r.bits == -8 || r.bits == 16 || r.bits == 32) return false; // addr regs must be 64-bit
+            if (m.base < 0) { m.base = r.code; m.bExt = r.ext; }
+            else if (m.index < 0) { m.index = r.code; m.iExt = r.ext; m.scale = 1; }
+            else return false;
+            regs++;
+            continue;
+        }
+        int64_t v = 0;
+        if (!asm_num(tok.c_str(), v)) return false;
+        m.disp += (tk.first == '-' ? -v : v); m.hasDisp = true;
+    }
+    if (!regs && !m.hasDisp) return false;
+    return true;
+}
+static int asm_rex(BYTE* o, int w, int r, int x, int b, int f = 0) {
+    int v = 0x40 | (w ? 8 : 0) | (r ? 4 : 0) | (x ? 2 : 0) | (b ? 1 : 0);
+    if (v == 0x40 && !f) return 0;
+    o[0] = (BYTE)v; return 1;
+}
+// Emit modrm(+sib+disp) for [mem]. reg3 = reg field. va+oplen = address AFTER
+// this modrm block (needed for RIP-relative). Returns bytes written (0 = fail).
+static int asm_modrm(BYTE* o, int reg3, const AsmMem& m, UINT64 va, int oplen, char* err, int errSz) {
+    bool sib = (m.index >= 0) || ((m.base & 7) == 4 && m.base >= 0);
+    int mod = 0, rm = 0;
+    int64_t disp = m.disp;
+    int dispSz = 0;
+    if (m.rip) {
+        // [rip+disp]: disp32 is relative — user value is the raw displacement
+        mod = 0; rm = 5; dispSz = 4;
+        if (m.base >= 0 || m.index >= 0) { snprintf(err, errSz, "rip cannot mix with regs"); return 0; }
+    }
+    else if (m.base < 0 && m.index < 0) {
+        // absolute [addr] -> encode as RIP-relative reaching it
+        int pli = oplen + (sib ? 2 : 1) + 4; // predicted full len
+        int64_t rel = disp - (int64_t)(va + pli);
+        if (rel < INT32_MIN || rel > INT32_MAX) { snprintf(err, errSz, "address out of range"); return 0; }
+        mod = 0; rm = 5; disp = rel; dispSz = 4;
+    }
+    else if (m.base < 0) {
+        // [index*scale + disp] (no base)
+        mod = 0; sib = true; dispSz = 4;
+    }
+    else {
+        bool noDisp = !m.hasDisp || disp == 0;
+        if ((m.base & 7) == 5 && noDisp) { mod = 1; disp = 0; dispSz = 1; } // [rbp] needs disp0
+        else if (noDisp) { mod = 0; dispSz = 0; }
+        else if (disp >= -128 && disp <= 127) { mod = 1; dispSz = 1; }
+        else if (disp >= INT32_MIN && disp <= INT32_MAX) { mod = 2; dispSz = 4; }
+        else { snprintf(err, errSz, "displacement out of range"); return 0; }
+    }
+    int p = 0;
+    if (sib) {
+        rm = 4;
+        o[p++] = (BYTE)((mod << 6) | ((reg3 & 7) << 3) | rm);
+        int idx = (m.index < 0) ? 4 : (m.index & 7);
+        int bse = (m.base < 0) ? 5 : (m.base & 7);
+        int ss = (m.scale == 8) ? 3 : (m.scale == 4) ? 2 : (m.scale == 2) ? 1 : 0;
+        o[p++] = (BYTE)((ss << 6) | (idx << 3) | bse);
+    }
+    else {
+        rm = m.rip ? 5 : (m.base & 7);
+        o[p++] = (BYTE)((mod << 6) | ((reg3 & 7) << 3) | rm);
+    }
+    if (m.rip) {
+        int32_t d = (int32_t)disp;
+        memcpy(o + p, &d, 4); p += 4;
+    }
+    else if (dispSz == 1) o[p++] = (BYTE)(int8_t)disp;
+    else if (dispSz == 4) { int32_t d = (int32_t)disp; memcpy(o + p, &d, 4); p += 4; }
+    return p;
+}
+// Assemble one line at `va`. Returns byte count (>0) or -1 + err text.
+static int AssembleLine(const char* text, UINT64 va, BYTE* out, char* err, int errSz) {
+    snprintf(err, errSz, "?");
+    char b[256]{}; snprintf(b, sizeof(b), "%s", text ? text : "");
+    // trim
+    char* s = b;
+    while (*s && isspace((unsigned char)*s)) s++;
+    size_t L = strlen(s);
+    while (L && isspace((unsigned char)s[L - 1])) s[--L] = 0;
+    if (!*s) { snprintf(err, errSz, "empty line"); return -1; }
+    // mnemonic
+    char mn[16]{}; size_t mi = 0;
+    while (*s && !isspace((unsigned char)*s) && mi < 15) mn[mi++] = (char)tolower((unsigned char)*s++);
+    while (*s && isspace((unsigned char)*s)) s++;
+    // operands split by ',' outside brackets
+    std::vector<std::string> ops;
+    { std::string cur; int dep = 0; for (char* p = s; ; p++) { char c = *p; if (!c || (c == ',' && !dep)) { size_t a = 0, e = cur.size(); while (a < e && isspace((unsigned char)cur[a])) a++; while (e > a && isspace((unsigned char)cur[e - 1])) e--; if (e > a) ops.push_back(cur.substr(a, e - a)); cur.clear(); if (!c) break; } else { if (c == '[') dep++; if (c == ']') dep--; cur += c; } } }
+    auto isMem = [](const std::string& t) { return t.size() >= 2 && t.front() == '['; };
+    int p = 0;
+    auto aluIdx = [&](const char* m) -> int {
+        if (!strcmp(m, "add")) return 0; if (!strcmp(m, "or")) return 1; if (!strcmp(m, "adc")) return 2;
+        if (!strcmp(m, "sbb")) return 3; if (!strcmp(m, "and")) return 4; if (!strcmp(m, "sub")) return 5;
+        if (!strcmp(m, "xor")) return 6; if (!strcmp(m, "cmp")) return 7; return -1;
+    };
+    if ((!strcmp(mn, "nop") || !strcmp(mn, "ret") || !strcmp(mn, "int3") || !strcmp(mn, "leave")) && ops.empty()) {
+        out[p++] = !strcmp(mn, "nop") ? (BYTE)0x90 : !strcmp(mn, "ret") ? (BYTE)0xC3 : !strcmp(mn, "int3") ? (BYTE)0xCC : (BYTE)0xC9;
+        return p;
+    }
+    if (!strcmp(mn, "db")) {
+        if (ops.empty()) { snprintf(err, errSz, "db needs bytes"); return -1; }
+        for (auto& t : ops) { int64_t v = 0; if (!asm_num(t.c_str(), v) || v < -128 || v > 255) { snprintf(err, errSz, "bad db byte '%s'", t.c_str()); return -1; } out[p++] = (BYTE)v; if (p > 15) { snprintf(err, errSz, "line too long"); return -1; } }
+        return p;
+    }
+    if ((!strcmp(mn, "push") || !strcmp(mn, "pop")) && ops.size() == 1 && !isMem(ops[0])) {
+        AsmReg r{};
+        if (!asm_reg(ops[0].c_str(), r)) { snprintf(err, errSz, "bad register '%s'", ops[0].c_str()); return -1; }
+        if (r.bits == 8 || r.bits == -8 || r.bits == 16 || r.bits == 32) {
+            if (!strcmp(mn, "pop") || r.bits != 32) { snprintf(err, errSz, "use 64-bit reg"); return -1; }
+        }
+        if (r.bits == -8) { snprintf(err, errSz, "high byte regs need REX-less form"); return -1; }
+        p += asm_rex(out + p, 0, 0, 0, r.ext);
+        out[p++] = (BYTE)((!strcmp(mn, "push") ? 0x50 : 0x58) + (r.code & 7));
+        return p;
+    }
+    if (!strcmp(mn, "push") && ops.size() == 1 && !isMem(ops[0])) {
+        int64_t v = 0; // push imm
+        if (!asm_num(ops[0].c_str(), v)) { snprintf(err, errSz, "bad operand"); return -1; }
+        if (v >= -128 && v <= 127) { out[p++] = 0x6A; out[p++] = (BYTE)(int8_t)v; }
+        else if (v >= INT32_MIN && v <= INT32_MAX) { out[p++] = 0x68; int32_t t = (int32_t)v; memcpy(out + p, &t, 4); p += 4; }
+        else { snprintf(err, errSz, "imm out of range"); return -1; }
+        return p;
+    }
+    if ((!strcmp(mn, "inc") || !strcmp(mn, "dec") || !strcmp(mn, "not") || !strcmp(mn, "neg") ||
+         !strcmp(mn, "mul") || !strcmp(mn, "imul") || !strcmp(mn, "div") || !strcmp(mn, "idiv") ||
+         !strcmp(mn, "call") || !strcmp(mn, "jmp") || !strcmp(mn, "push")) && ops.size() == 1) {
+        int grp = -1, opc = 0xFF; bool fw = true;
+        if (!strcmp(mn, "inc")) grp = 0; else if (!strcmp(mn, "dec")) grp = 1;
+        else if (!strcmp(mn, "call")) grp = 2; else if (!strcmp(mn, "jmp")) grp = 4;
+        else if (!strcmp(mn, "push")) grp = 6;
+        else { opc = 0xF7; if (!strcmp(mn, "not")) grp = 2; else if (!strcmp(mn, "neg")) grp = 3; else if (!strcmp(mn, "mul")) grp = 4; else if (!strcmp(mn, "imul")) grp = 5; else if (!strcmp(mn, "div")) grp = 6; else grp = 7; }
+        bool mem = isMem(ops[0]);
+        if (mem) {
+            AsmMem m{};
+            if (!asm_mem(ops[0].c_str(), m)) { snprintf(err, errSz, "bad memory '%s'", ops[0].c_str()); return -1; }
+            int w = 1;
+            p += asm_rex(out + p, w, 0, m.iExt, m.bExt);
+            out[p++] = (BYTE)opc;
+            int n = asm_modrm(out + p, grp, m, va, p + 2, err, errSz); if (!n) return -1; p += n;
+            return p;
+        }
+        AsmReg r{};
+        if (!asm_reg(ops[0].c_str(), r)) { snprintf(err, errSz, "bad operand '%s'", ops[0].c_str()); return -1; }
+        if (!strcmp(mn, "call") || !strcmp(mn, "jmp")) {
+            if (r.bits == 8 || r.bits == -8 || r.bits == 16 || r.bits == 32) { snprintf(err, errSz, "use 64-bit reg"); return -1; }
+            p += asm_rex(out + p, 0, 0, 0, r.ext);
+            out[p++] = 0xFF; out[p++] = (BYTE)((grp << 3) | 0xC0 | (r.code & 7));
+            return p;
+        }
+        if (r.bits == 8 && opc == 0xFF) { snprintf(err, errSz, "needs 16/32/64-bit reg"); return -1; }
+        if (r.bits == -8) { snprintf(err, errSz, "high byte regs unsupported here"); return -1; }
+        int w = (r.bits == 64) ? 1 : 0, op16 = (r.bits == 16) ? 1 : 0;
+        if (op16) out[p++] = 0x66;
+        int useOpc = opc;
+        if (opc == 0xF7 && r.bits == 8) useOpc = 0xF6;
+        p += asm_rex(out + p, w && useOpc == 0xF7, 0, 0, r.ext, (useOpc == 0xF6) ? r.fr : 0);
+        out[p++] = (BYTE)useOpc; out[p++] = (BYTE)((grp << 3) | 0xC0 | (r.code & 7));
+        return p;
+    }
+    if ((!strcmp(mn, "call") || !strcmp(mn, "jmp")) && ops.size() == 1) {
+        int64_t t = 0;
+        if (!asm_num(ops[0].c_str(), t)) { snprintf(err, errSz, "bad address"); return -1; }
+        int64_t rel = t - (int64_t)(va + 5);
+        if (rel < INT32_MIN || rel > INT32_MAX) { snprintf(err, errSz, "target out of range"); return -1; }
+        out[p++] = (BYTE)(!strcmp(mn, "call") ? 0xE8 : 0xE9);
+        int32_t r = (int32_t)rel; memcpy(out + p, &r, 4); p += 4;
+        return p;
+    }
+    { // jcc addr
+        static const char* jn[] = { "jo","jno","jb","jae","je","jne","jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg", nullptr };
+        int ji = -1;
+        for (int i = 0; jn[i]; i++) if (!strcmp(mn, jn[i])) ji = i;
+        if (ji >= 0 && ops.size() == 1) {
+            int64_t t = 0;
+            if (!asm_num(ops[0].c_str(), t)) { snprintf(err, errSz, "bad address"); return -1; }
+            int64_t rs = t - (int64_t)(va + 2);
+            if (rs >= -128 && rs <= 127) { out[p++] = (BYTE)(0x70 + ji); out[p++] = (BYTE)(int8_t)rs; }
+            else { int64_t rl = t - (int64_t)(va + 6); if (rl < INT32_MIN || rl > INT32_MAX) { snprintf(err, errSz, "target out of range"); return -1; } out[p++] = 0x0F; out[p++] = (BYTE)(0x80 + ji); int32_t r = (int32_t)rl; memcpy(out + p, &r, 4); p += 4; }
+            return p;
+        }
+    }
+    if ((!strcmp(mn, "mov") || !strcmp(mn, "movzx") || !strcmp(mn, "movsx") || !strcmp(mn, "lea") || !strcmp(mn, "xchg")) && ops.size() == 2) {
+        bool zx = !strcmp(mn, "movzx"), sx = !strcmp(mn, "movsx"), lea = !strcmp(mn, "lea"), xg = !strcmp(mn, "xchg");
+        bool dMem = isMem(ops[0]), sMem = isMem(ops[1]);
+        if (dMem && sMem) { snprintf(err, errSz, "cannot mov mem, mem"); return -1; }
+        AsmReg rd{}, rs{};
+        bool dR = !dMem && asm_reg(ops[0].c_str(), rd);
+        bool sR = !sMem && asm_reg(ops[1].c_str(), rs);
+        AsmMem dm{}, sm{};
+        if (dMem && !asm_mem(ops[0].c_str(), dm)) { snprintf(err, errSz, "bad memory '%s'", ops[0].c_str()); return -1; }
+        if (sMem && !asm_mem(ops[1].c_str(), sm)) { snprintf(err, errSz, "bad memory '%s'", ops[1].c_str()); return -1; }
+        if (lea && (dMem || !sMem || !dR)) { snprintf(err, errSz, "lea reg, [mem]"); return -1; }
+        if ((zx || sx) && (dMem || !sMem || !sR)) { snprintf(err, errSz, "movzx/movsx reg, r/m8/16"); return -1; }
+        if (!dR && !dMem) { snprintf(err, errSz, "bad destination '%s'", ops[0].c_str()); return -1; }
+        if (!sR && !sMem && !(dR && !zx && !sx && !lea && !xg)) { snprintf(err, errSz, "bad source '%s'", ops[1].c_str()); return -1; }
+        // mov reg, imm
+        if (dR && !sR && !sMem && !zx && !sx && !lea) {
+            int64_t v = 0;
+            if (!asm_num(ops[1].c_str(), v)) { snprintf(err, errSz, "bad immediate '%s'", ops[1].c_str()); return -1; }
+            if (rd.bits == -8) { snprintf(err, errSz, "cannot mov to high byte reg here"); return -1; }
+            if (rd.bits == 64) {
+                p += asm_rex(out + p, 1, 0, 0, rd.ext);
+                out[p++] = (BYTE)(0xB8 + (rd.code & 7));
+                memcpy(out + p, &v, 8); p += 8;
+            }
+            else if (rd.bits == 8) {
+                if (v < -128 || v > 255) { snprintf(err, errSz, "imm out of range"); return -1; }
+                p += asm_rex(out + p, 0, 0, 0, rd.ext, rd.fr);
+                out[p++] = (BYTE)(0xB0 + (rd.code & 7)); out[p++] = (BYTE)v;
+            }
+            else {
+                if (v < INT32_MIN || v > UINT32_MAX) { snprintf(err, errSz, "imm out of range"); return -1; }
+                if (rd.bits == 16) out[p++] = 0x66;
+                p += asm_rex(out + p, 0, 0, 0, rd.ext);
+                out[p++] = (BYTE)(0xB8 + (rd.code & 7));
+                if (rd.bits == 16) { uint16_t t = (uint16_t)v; memcpy(out + p, &t, 2); p += 2; }
+                else { uint32_t t = (uint32_t)v; memcpy(out + p, &t, 4); p += 4; }
+            }
+            return p;
+        }
+        // mov [mem], imm
+        if (dMem && !sR && !sMem && !strcmp(mn, "mov")) {
+            int64_t v = 0;
+            if (!asm_num(ops[1].c_str(), v)) { snprintf(err, errSz, "bad immediate"); return -1; }
+            // need width: default 32-bit unless value fits byte? CE: mov [rax], 1 -> dword. Use 32-bit.
+            if (v < INT32_MIN || v > UINT32_MAX) { snprintf(err, errSz, "imm out of range (32-bit)"); return -1; }
+            p += asm_rex(out + p, 0, 0, dm.iExt, dm.bExt);
+            out[p++] = 0xC7;
+            int n = asm_modrm(out + p, 0, dm, va, p + 2, err, errSz); if (!n) return -1; p += n;
+            uint32_t t = (uint32_t)v; memcpy(out + p, &t, 4); p += 4;
+            return p;
+        }
+        int bits = dR ? rd.bits : rs.bits;
+        if (bits == -8) { snprintf(err, errSz, "high byte regs unsupported here"); return -1; }
+        bool byte = (bits == 8);
+        int w = (bits == 64) ? 1 : 0, op16 = (bits == 16) ? 1 : 0;
+        int opc = 0;
+        if (lea) opc = 0x8D;
+        else if (zx) opc = -1; // two-byte B6/B7
+        else if (sx) opc = -2; // BE/BF
+        else if (xg) opc = byte ? 0x86 : 0x87;
+        else if (!strcmp(mn, "mov")) {
+            if (dR && sMem) opc = byte ? 0x8A : 0x8B;
+            else if (dMem && sR) opc = byte ? 0x88 : 0x89;
+            else opc = byte ? 0x88 : 0x89; // reg,reg via 89 form
+        }
+        if (op16) out[p++] = 0x66;
+        if (opc == -1 || opc == -2) {
+            int sb = sR ? rs.bits : 8; // mem source width from reg or default byte? need explicit: movzx eax, [rbx] -> byte
+            if (sMem) { // width ambiguous: pick byte unless user reg implies? default byte, document
+                sb = 8;
+            }
+            if (sb != 8 && sb != 16) { snprintf(err, errSz, "movzx/movsx source must be 8/16-bit"); return -1; }
+            // order: [66] REX 0F op modrm
+            p += asm_rex(out + p, w, dR ? rd.ext : 0, sMem ? sm.iExt : (sR ? rs.ext : 0), 0, (sR && sb == 8) ? rs.fr : 0);
+            out[p++] = 0x0F;
+            out[p++] = (BYTE)((opc == -1 ? (sb == 8 ? 0xB6 : 0xB7) : (sb == 8 ? 0xBE : 0xBF)));
+            int reg3 = dR ? rd.code : 0;
+            if (sMem) { int n = asm_modrm(out + p, reg3, sm, va, p + 2, err, errSz); if (!n) return -1; p += n; }
+            else { out[p++] = (BYTE)(0xC0 | ((reg3 & 7) << 3) | (rs.code & 7)); }
+            return p;
+        }
+        int rE = 0, bE = 0;
+        const AsmMem* mm = nullptr;
+        int reg3 = 0;
+        if (dR && sR) { rE = rs.ext; bE = rd.ext; reg3 = rs.code; }
+        else if (dR && sMem) { rE = rd.ext; bE = 0; mm = &sm; reg3 = rd.code; }
+        else if (dMem && sR) { rE = 0; bE = 0; mm = &dm; reg3 = rs.code; }
+        else { snprintf(err, errSz, "unsupported operands"); return -1; }
+        // NOTE: for dR&&sR form with 89, reg field = source. REX.R = source ext, REX.B = dest ext.
+        int rexR = (dR && sR) ? rs.ext : (dR ? rd.ext : rs.ext);
+        int rexB = (dR && sR) ? rd.ext : 0;
+        int rexX = mm ? mm->iExt : 0;
+        int rexBm = mm ? mm->bExt : 0;
+        if (dMem && sR) { rexR = rs.ext; rexBm = dm.bExt; rexX = dm.iExt; }
+        if (dR && sMem) { rexR = rd.ext; }
+        (void)rE; (void)bE; (void)rexB; (void)rexBm;
+        p += asm_rex(out + p, (byte || opc == 0x8D) ? (w && !byte) : w, rexR, rexX, (dR && sR) ? rd.ext : (mm ? mm->bExt : 0),
+            byte ? ((dR ? rd.fr : 0) | (sR ? rs.fr : 0)) : 0);
+        out[p++] = (BYTE)opc;
+        if (mm) { int n = asm_modrm(out + p, reg3, *mm, va, p + 2, err, errSz); if (!n) return -1; p += n; }
+        else {
+            int dst = dR ? rd.code : 0, src = sR ? rs.code : 0;
+            int dstR = dMem ? 0 : rd.code, srcR = sMem ? 0 : rs.code;
+            (void)dst; (void)src;
+            int rmSide = (opc == 0x8B || opc == 0x8A) ? dstR : ((opc == 0x89 || opc == 0x88) ? dstR : dstR);
+            // reg field vs rm: for 8B/8A reg=dest; for 89/88 reg=source; reg,reg default 89
+            int rf = ((opc == 0x8B || opc == 0x8A || opc == 0x8D || lea) ? dstR : srcR);
+            int rmf = ((opc == 0x8B || opc == 0x8A || opc == 0x8D || lea) ? srcR : dstR);
+            out[p++] = (BYTE)(0xC0 | ((rf & 7) << 3) | (rmf & 7));
+            (void)rmSide;
+        }
+        return p;
+    }
+    { // ALU r,r / r,imm / m,r / m,imm + test + imul r,r[,imm] + shifts
+        int ai = aluIdx(mn);
+        bool tst = !strcmp(mn, "test");
+        bool iml = !strcmp(mn, "imul");
+        bool ish = !strcmp(mn, "shl") || !strcmp(mn, "shr") || !strcmp(mn, "sar") || !strcmp(mn, "rol") || !strcmp(mn, "ror");
+        if ((ai >= 0 || tst) && ops.size() == 2) {
+            bool dM = isMem(ops[0]);
+            AsmReg dr{}, sr2{};
+            bool drR = !dM && asm_reg(ops[0].c_str(), dr);
+            bool srR = !isMem(ops[1]) && asm_reg(ops[1].c_str(), sr2);
+            if (drR && srR) {
+                if (dr.bits != sr2.bits || dr.bits == -8 || sr2.bits == -8) { snprintf(err, errSz, "operand size mismatch"); return -1; }
+                bool byte = (dr.bits == 8);
+                int w = (dr.bits == 64);
+                if (dr.bits == 16) out[p++] = 0x66;
+                p += asm_rex(out + p, w && !byte, sr2.ext, 0, dr.ext, byte ? (dr.fr | sr2.fr) : 0);
+                out[p++] = (BYTE)((tst ? 0x84 : 0x00) + (ai >= 0 ? (ai << 3) + 1 : 0) + (byte ? 0 : 0));
+                // 01-family: 01/09/11/... = 0x01 + ai*8 ; test = 0x85
+                out[p - 1] = (BYTE)(tst ? (byte ? 0x84 : 0x85) : (0x01 + ai * 8 + (byte ? 0 : 0)));
+                if (!byte && tst) out[p - 1] = 0x85;
+                if (byte && ai >= 0) out[p - 1] = (BYTE)(0x00 + ai * 8);
+                out[p++] = (BYTE)(0xC0 | ((sr2.code & 7) << 3) | (dr.code & 7));
+                return p;
+            }
+            if (drR && !srR && !isMem(ops[1])) {
+                int64_t v = 0;
+                if (!asm_num(ops[1].c_str(), v)) { snprintf(err, errSz, "bad immediate"); return -1; }
+                if (dr.bits == -8) { snprintf(err, errSz, "unsupported"); return -1; }
+                bool byte = (dr.bits == 8);
+                if (tst) {
+                    if (byte) { p += asm_rex(out + p, 0, 0, 0, dr.ext, dr.fr); out[p++] = 0xF6; out[p++] = (BYTE)(0xC0 | (dr.code & 7)); if (v < 0 || v > 255) { snprintf(err, errSz, "imm out of range"); return -1; } out[p++] = (BYTE)v; }
+                    else { int w = (dr.bits == 64); if (dr.bits == 16) out[p++] = 0x66; p += asm_rex(out + p, w, 0, 0, dr.ext); out[p++] = 0xF7; out[p++] = (BYTE)(0xC0 | (dr.code & 7)); if (v < INT32_MIN || v > UINT32_MAX) { snprintf(err, errSz, "imm out of range"); return -1; } if (dr.bits == 16) { uint16_t t = (uint16_t)v; memcpy(out + p, &t, 2); p += 2; } else { uint32_t t = (uint32_t)v; memcpy(out + p, &t, 4); p += 4; } }
+                    return p;
+                }
+                if (byte) {
+                    if (v < -128 || v > 255) { snprintf(err, errSz, "imm out of range"); return -1; }
+                    p += asm_rex(out + p, 0, 0, 0, dr.ext, dr.fr);
+                    out[p++] = 0x80; out[p++] = (BYTE)((ai << 3) | 0xC0 | (dr.code & 7)); out[p++] = (BYTE)v;
+                }
+                else if (v >= -128 && v <= 127) {
+                    int w = (dr.bits == 64); if (dr.bits == 16) out[p++] = 0x66;
+                    p += asm_rex(out + p, w, 0, 0, dr.ext);
+                    out[p++] = 0x83; out[p++] = (BYTE)((ai << 3) | 0xC0 | (dr.code & 7)); out[p++] = (BYTE)(int8_t)v;
+                }
+                else {
+                    if (v < INT32_MIN || v > UINT32_MAX) { snprintf(err, errSz, "imm out of range"); return -1; }
+                    int w = (dr.bits == 64); if (dr.bits == 16) out[p++] = 0x66;
+                    p += asm_rex(out + p, w, 0, 0, dr.ext);
+                    out[p++] = 0x81; out[p++] = (BYTE)((ai << 3) | 0xC0 | (dr.code & 7));
+                    if (dr.bits == 16) { uint16_t t = (uint16_t)v; memcpy(out + p, &t, 2); p += 2; } else { uint32_t t = (uint32_t)v; memcpy(out + p, &t, 4); p += 4; }
+                }
+                return p;
+            }
+            // r,[m] and [m],r
+            if ((drR && isMem(ops[1])) || (dM && srR)) {
+                bool dstM = dM;
+                AsmMem mm{}; AsmReg rr{};
+                if (dstM) { if (!asm_mem(ops[0].c_str(), mm) || !asm_reg(ops[1].c_str(), rr)) { snprintf(err, errSz, "bad operands"); return -1; } }
+                else { if (!asm_mem(ops[1].c_str(), mm) || true) {} rr = dr; AsmMem t2{}; if (!asm_mem(ops[1].c_str(), t2)) { snprintf(err, errSz, "bad memory"); return -1; } mm = t2; sr2 = dr; }
+                AsmReg& r = dstM ? rr : sr2;
+                if (r.bits == -8) { snprintf(err, errSz, "unsupported"); return -1; }
+                bool byte = (r.bits == 8);
+                int w = (r.bits == 64); if (r.bits == 16) out[p++] = 0x66;
+                p += asm_rex(out + p, w && !byte, r.ext, mm.iExt, mm.bExt);
+                BYTE opc = tst ? (byte ? 0x84 : 0x85) : (BYTE)(dstM ? (byte ? 0x00 : 0x01) + ai * 8 : (byte ? 0x02 : 0x03) + ai * 8);
+                out[p++] = opc;
+                int n = asm_modrm(out + p, r.code, mm, va, p + 2, err, errSz); if (!n) return -1; p += n;
+                return p;
+            }
+            snprintf(err, errSz, "unsupported operands"); return -1;
+        }
+        if (iml && (ops.size() == 2 || ops.size() == 3)) {
+            AsmReg d{}, s2{};
+            if (isMem(ops[0]) || !asm_reg(ops[0].c_str(), d)) { snprintf(err, errSz, "imul dst must be reg"); return -1; }
+            if (ops.size() == 2) {
+                if (isMem(ops[1])) { AsmMem mm{}; if (!asm_mem(ops[1].c_str(), mm)) { snprintf(err, errSz, "bad memory"); return -1; } if (d.bits == 8 || d.bits == -8 || d.bits == 16) { /* allow 16 */ } int w = (d.bits == 64); if (d.bits == 16) out[p++] = 0x66; p += asm_rex(out + p, w, d.ext, mm.iExt, mm.bExt); out[p++] = 0x0F; out[p++] = 0xAF; int n = asm_modrm(out + p, d.code, mm, va, p + 2, err, errSz); if (!n) return -1; p += n; return p; }
+                if (!asm_reg(ops[1].c_str(), s2) || s2.bits != d.bits) { snprintf(err, errSz, "size mismatch"); return -1; }
+                int w = (d.bits == 64); if (d.bits == 16) out[p++] = 0x66;
+                p += asm_rex(out + p, w, d.ext, 0, s2.ext);
+                out[p++] = 0x0F; out[p++] = 0xAF; out[p++] = (BYTE)(0xC0 | ((d.code & 7) << 3) | (s2.code & 7));
+                return p;
+            }
+            else {
+                int64_t v = 0;
+                if (!asm_num(ops[2].c_str(), v)) { snprintf(err, errSz, "bad immediate"); return -1; }
+                bool use8 = (v >= -128 && v <= 127);
+                AsmMem mm{}; bool sm = isMem(ops[1]);
+                if (sm && !asm_mem(ops[1].c_str(), mm)) { snprintf(err, errSz, "bad memory"); return -1; }
+                if (!sm && !asm_reg(ops[1].c_str(), s2)) { snprintf(err, errSz, "bad source"); return -1; }
+                int w = (d.bits == 64); if (d.bits == 16) out[p++] = 0x66;
+                p += asm_rex(out + p, w, d.ext, sm ? mm.iExt : s2.ext, 0);
+                out[p++] = (BYTE)(use8 ? 0x6B : 0x69);
+                if (sm) { int n = asm_modrm(out + p, d.code, mm, va, p + 2 + (use8 ? 1 : (d.bits == 16 ? 2 : 4)), err, errSz); if (!n) return -1; p += n; }
+                else out[p++] = (BYTE)(0xC0 | ((d.code & 7) << 3) | (s2.code & 7));
+                if (use8) out[p++] = (BYTE)(int8_t)v;
+                else if (d.bits == 16) { if (v < -32768 || v > 65535) { snprintf(err, errSz, "imm out of range"); return -1; } uint16_t t = (uint16_t)v; memcpy(out + p, &t, 2); p += 2; }
+                else { if (v < INT32_MIN || v > INT32_MAX) { snprintf(err, errSz, "imm out of range"); return -1; } int32_t t = (int32_t)v; memcpy(out + p, &t, 4); p += 4; }
+                return p;
+            }
+        }
+        if (ish && ops.size() == 2) {
+            bool dM = isMem(ops[0]);
+            AsmReg dr2{};
+            if (!dM && !asm_reg(ops[0].c_str(), dr2)) { snprintf(err, errSz, "bad destination"); return -1; }
+            AsmMem mm{}; if (dM && !asm_mem(ops[0].c_str(), mm)) { snprintf(err, errSz, "bad memory"); return -1; }
+            int bits = dM ? 32 : dr2.bits; // default dword for mem (explicit reg width preferred)
+            if (!dM) bits = dr2.bits;
+            if (bits == -8) { snprintf(err, errSz, "unsupported"); return -1; }
+            bool byte = (bits == 8);
+            int grp = !strcmp(mn, "rol") ? 0 : !strcmp(mn, "ror") ? 1 : !strcmp(mn, "shl") ? 4 : !strcmp(mn, "shr") ? 5 : 7;
+            std::string c2 = ops[1];
+            for (auto& ch : c2) ch = (char)tolower((unsigned char)ch);
+            if (c2 == "1") {
+                int w = (bits == 64); if (bits == 16) out[p++] = 0x66;
+                if (!dM) { p += asm_rex(out + p, w && !byte, 0, 0, dr2.ext, byte ? dr2.fr : 0); out[p++] = (BYTE)(byte ? 0xD0 : 0xD1); out[p++] = (BYTE)((grp << 3) | 0xC0 | (dr2.code & 7)); }
+                else { p += asm_rex(out + p, w && !byte, 0, mm.iExt, mm.bExt); out[p++] = (BYTE)(byte ? 0xD0 : 0xD1); int n = asm_modrm(out + p, grp, mm, va, p + 2, err, errSz); if (!n) return -1; p += n; }
+                return p;
+            }
+            if (c2 == "cl") {
+                int w = (bits == 64); if (bits == 16) out[p++] = 0x66;
+                if (!dM) { p += asm_rex(out + p, w && !byte, 0, 0, dr2.ext, byte ? dr2.fr : 0); out[p++] = (BYTE)(byte ? 0xD2 : 0xD3); out[p++] = (BYTE)((grp << 3) | 0xC0 | (dr2.code & 7)); }
+                else { p += asm_rex(out + p, w && !byte, 0, mm.iExt, mm.bExt); out[p++] = (BYTE)(byte ? 0xD2 : 0xD3); int n = asm_modrm(out + p, grp, mm, va, p + 2, err, errSz); if (!n) return -1; p += n; }
+                return p;
+            }
+            int64_t v = 0;
+            if (!asm_num(c2.c_str(), v) || v < 0 || v > 255) { snprintf(err, errSz, "bad count"); return -1; }
+            int w = (bits == 64); if (bits == 16) out[p++] = 0x66;
+            if (!dM) { p += asm_rex(out + p, w && !byte, 0, 0, dr2.ext, byte ? dr2.fr : 0); out[p++] = (BYTE)(byte ? 0xC0 : 0xC1); out[p++] = (BYTE)((grp << 3) | 0xC0 | (dr2.code & 7)); }
+            else { p += asm_rex(out + p, w && !byte, 0, mm.iExt, mm.bExt); out[p++] = (BYTE)(byte ? 0xC0 : 0xC1); int n = asm_modrm(out + p, grp, mm, va, p + 3, err, errSz); if (!n) return -1; p += n; }
+            out[p++] = (BYTE)v;
+            return p;
+        }
+    }
+    snprintf(err, errSz, "unsupported: '%s' (try db xx)", mn);
+    return -1;
 }
 
 //=================================================================
@@ -1814,6 +2779,99 @@ static void doAddSelectedToTable() {
     }
     char ab[32]; snprintf(ab, sizeof(ab), "%llX", (unsigned long long)addr);
     OpenManualAdd(ab, g_vtype);
+}
+static bool CopyText(const char* s) {
+    if (!s || !*s || !OpenClipboard(g_hwnd)) return false;
+    EmptyClipboard();
+    size_t n = strlen(s) + 1;
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, n);
+    if (!h) { CloseClipboard(); return false; }
+    memcpy(GlobalLock(h), s, n);
+    GlobalUnlock(h);
+    bool ok = (SetClipboardData(CF_TEXT, h) != nullptr);
+    CloseClipboard();
+    if (!ok) GlobalFree(h); // owned by clipboard on success
+    return ok;
+}
+// Copy table address cell. modForm=false -> literally as displayed (may have
+// P-> prefix); true -> clean "mod"+OFF (static, rebase-safe) or plain hex.
+static void TableCopy(bool modForm) {
+    HWND lv = ctl(IDC_TBL_LIST);
+    int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+    if (sel < 0) { setStatus("Select a table row first"); return; }
+    char out[192]{};
+    if (!modForm) {
+        LVITEMA lvi{}; lvi.iSubItem = 2; lvi.pszText = out; lvi.cchTextMax = sizeof(out);
+        SendMessageA(lv, LVM_GETITEMTEXTA, (WPARAM)sel, (LPARAM)&lvi);
+    }
+    else {
+        TblEntry e; bool got = false;
+        { std::lock_guard<std::mutex> lk(g_tableMtx); if ((size_t)sel < g_table.size()) { e = g_table[(size_t)sel]; got = true; } }
+        if (!got) return;
+        if (e.mod[0]) snprintf(out, sizeof(out), "\"%s\"+%llX", e.mod, (unsigned long long)e.modOff);
+        else {
+            UINT64 f = e.addr;
+            if (g_drv && g_attached && e.isPtr && !entry_final(e, f)) { setStatus("Unresolvable pointer"); return; }
+            char mb[160];
+            if (addr_display(f, mb, sizeof(mb))) snprintf(out, sizeof(out), "%s", mb);
+            else snprintf(out, sizeof(out), "%llX", (unsigned long long)f);
+        }
+    }
+    if (CopyText(out)) { char s[220]; snprintf(s, sizeof(s), "Copied %s", out); setStatus(s); }
+    else setStatus("Copy failed");
+}
+static void FoundCopy(bool modForm) {
+    HWND lv = ctl(IDC_FOUND_LIST);
+    int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+    if (sel < 0) { setStatus("Select a found row first"); return; }
+    char out[192]{};
+    if (!modForm) {
+        LVITEMA lvi{}; lvi.iSubItem = 0; lvi.pszText = out; lvi.cchTextMax = sizeof(out);
+        SendMessageA(lv, LVM_GETITEMTEXTA, (WPARAM)sel, (LPARAM)&lvi);
+    }
+    else {
+        UINT64 addr = 0;
+        { std::lock_guard<std::mutex> lk(g_candsMtx); if ((size_t)sel >= g_cands.size()) return; addr = g_cands[(size_t)sel].addr; }
+        char mb[160];
+        if (addr_display(addr, mb, sizeof(mb))) snprintf(out, sizeof(out), "%s", mb);
+        else snprintf(out, sizeof(out), "%llX", (unsigned long long)addr);
+    }
+    if (CopyText(out)) { char s[220]; snprintf(s, sizeof(s), "Copied %s", out); setStatus(s); }
+    else setStatus("Copy failed");
+}
+// Open Memory Viewer disassembling `addr` (existing window retargeted, else opened).
+static void GoToDism(UINT64 addr) {
+    if (!addr) { setStatus("Bad address"); return; }
+    if (!g_drv || !g_attached) { setStatus("Attach first"); return; }
+    if (g_mv) {
+        char a[32]; snprintf(a, sizeof(a), "%llX", (unsigned long long)addr);
+        SetDlgItemTextA(g_mv, MV_ADDR_EDIT, a);
+        doMemDump(); doMemDisasm();
+        SetForegroundWindow(g_mv);
+        return;
+    }
+    g_mvGoAddr = addr;
+    OpenMemView();
+    g_mvGoAddr = 0;
+}
+static void TableDism() {
+    HWND lv = ctl(IDC_TBL_LIST);
+    int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+    if (sel < 0) { setStatus("Select a table row first"); return; }
+    TblEntry e; bool got = false;
+    { std::lock_guard<std::mutex> lk(g_tableMtx); if ((size_t)sel < g_table.size()) { e = g_table[(size_t)sel]; got = true; } }
+    if (!got) return;
+    UINT64 f = e.addr;
+    if (!g_drv || !g_attached || !entry_final(e, f)) { setStatus("Unresolvable address"); return; }
+    GoToDism(f);
+}
+static void FoundDism() {
+    HWND lv = ctl(IDC_FOUND_LIST);
+    int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+    if (sel < 0) { setStatus("Select a found row first"); return; }
+    UINT64 addr = 0;
+    { std::lock_guard<std::mutex> lk(g_candsMtx); if ((size_t)sel >= g_cands.size()) return; addr = g_cands[(size_t)sel].addr; }
+    GoToDism(addr);
 }
 static void TableDeleteSel() {
     HWND lv = ctl(IDC_TBL_LIST);
@@ -2464,6 +3522,26 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 else PS_DoRescan(t);
                 return 0;
             }
+            if (mode == 9) {
+                // Single-line assembler: assemble + verified write + refresh views
+                std::string t = dlgText(h, DLG_VAL_EDIT);
+                BYTE enc[16]{}; char aerr[128]{};
+                int n = AssembleLine(t.c_str(), g_asmAddr, enc, aerr, sizeof(aerr));
+                if (n <= 0) { setStatus(aerr); SetFocus(GetDlgItem(h, DLG_VAL_EDIT)); return 0; }
+                if (!g_drv || !g_attached) { setStatus("Attach first"); DestroyWindow(h); return 0; }
+                if (!g_drv->write_bytes(g_asmAddr, enc, (SIZE_T)n)) { setStatus("Assemble write FAILED"); DestroyWindow(h); return 0; }
+                BYTE rb[16]{};
+                g_drv->read_raw(g_asmAddr, rb, (SIZE_T)n);
+                if (memcmp(rb, enc, (SIZE_T)n) != 0) setStatus("Assemble verify FAILED");
+                else {
+                    char s[128]; snprintf(s, sizeof(s), "Assembled %d byte(s) at %llX", n, (unsigned long long)g_asmAddr);
+                    setStatus(s);
+                }
+                DestroyWindow(h);
+                if (g_mv) { doMemDump(); doMemDisasm(); }
+                refresh_table();
+                return 0;
+            }
             if (mode == 5) {
                 // Change Description popup
                 std::string d = dlgText(h, DLG_DESC_EDIT);
@@ -2559,6 +3637,31 @@ static LRESULT CALLBACK MemProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int id = LOWORD(w);
         if (id == MV_DUMP_BTN) doMemDump();
         else if (id == MV_WRITE_BTN) doMemWrite();
+        else if (id == MV_DIS_BTN) { doMemDump(); doMemDisasm(); }
+        return 0;
+    }
+    else if (m == WM_NOTIFY) {
+        LPNMHDR nh = (LPNMHDR)l;
+        if (nh->idFrom == (UINT_PTR)MV_DIS_LIST && nh->code == NM_DBLCLK) {
+            LPNMITEMACTIVATE ia = (LPNMITEMACTIVATE)l;
+            int sel = ia->iItem;
+            if (sel < 0) sel = ListView_GetNextItem(nh->hwndFrom, -1, LVNI_SELECTED);
+            if (sel >= 0 && (size_t)sel < g_disAddr.size())
+                OpenAsmDialog(g_disAddr[(size_t)sel], g_disText[(size_t)sel].c_str());
+            return 0;
+        }
+    }
+    else if (m == WM_GETMINMAXINFO) {
+        LPMINMAXINFO mm = (LPMINMAXINFO)l;
+        mm->ptMinTrackSize.x = 500; mm->ptMinTrackSize.y = 380;
+        return 0;
+    }
+    else if (m == WM_SIZE) {
+        int cw = LOWORD(l), ch = HIWORD(l);
+        HWND lv = GetDlgItem(h, MV_DIS_LIST), hx = GetDlgItem(h, MV_HEX_EDIT);
+        int disH = (std::max)(120, (ch - 56) * 42 / 100);
+        if (lv) SetWindowPos(lv, nullptr, 12, 44, (std::max)(cw - 24, 200), disH, SWP_NOZORDER);
+        if (hx) SetWindowPos(hx, nullptr, 12, 50 + disH, (std::max)(cw - 24, 200), (std::max)(ch - 62 - disH, 80), SWP_NOZORDER);
         return 0;
     }
     else if (m == WM_CLOSE) { DestroyWindow(h); return 0; }
@@ -2841,6 +3944,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         else if (id == CTX_ADD) doAddFoundToTableDirect();
         else if (id == CTX_PS) { if (g_ctxFound) PS_ForFoundRow(); else PS_ForTableRow(); }
+        else if (id == CTX_COPY_ASIS || id == CTX_COPY_MOD) {
+            if (g_ctxFound) FoundCopy(id == CTX_COPY_MOD);
+            else TableCopy(id == CTX_COPY_MOD);
+        }
+        else if (id == CTX_DISM) { if (g_ctxFound) FoundDism(); else TableDism(); }
         else if (id == 9013) PS_ForTableRow();
         else if (id == 9003) { if (!g_connected) std::thread(DriverThread).detach(); }
         else if (id == IDC_FIRST_BTN || id == 9004) start_first();
@@ -2947,6 +4055,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int hit = ListView_HitTest(child, &ht);
         if (hit >= 0) ListView_SetItemState(child, hit, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         HMENU m = CreatePopupMenu();
+        HMENU copySub = CreatePopupMenu();
+        AppendMenuA(copySub, MF_STRING, CTX_COPY_ASIS, "As it is");
+        AppendMenuA(copySub, MF_STRING, CTX_COPY_MOD, "Module+Address");
         g_ctxFound = isFound;
         if (isTbl) {
             AppendMenuA(m, MF_STRING, CTX_DEL, "Delete This Address");
@@ -2956,10 +4067,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AppendMenuA(m, MF_STRING, CTX_DESC, "Change Description");
             AppendMenuA(m, MF_STRING, CTX_ADDR, "Change Address...");
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(m, MF_POPUP, (UINT_PTR)copySub, "Copy address");
+            AppendMenuA(m, MF_STRING, CTX_DISM, "Go to Dism");
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuA(m, MF_STRING, CTX_PS, "Pointer Scan for This Address");
         }
         else {
             AppendMenuA(m, MF_STRING, CTX_ADD, "Add to Address List");
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(m, MF_POPUP, (UINT_PTR)copySub, "Copy address");
+            AppendMenuA(m, MF_STRING, CTX_DISM, "Go to Dism");
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuA(m, MF_STRING, CTX_PS, "Pointer Scan for This Address");
         }
