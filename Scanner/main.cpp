@@ -263,7 +263,7 @@ enum {
     DLG_X = 1000, DLG_DESC_EDIT, DLG_ADDR_EDIT, DLG_TYPE_CB, DLG_VAL_EDIT, DLG_OK_BTN, DLG_CANCEL_BTN,
     DLG_HEX_CHK = 1020, DLG_SIGNED_CHK, DLG_PTR_CHK, DLG_OFF_EDIT, DLG_PREVIEW,
     DLG_OFF0 = 1030, DLG_OFF1, DLG_OFF2, DLG_OFF3, DLG_OFF4,
-    DLG_CHAIN = 1035, DLG_ADD_OFF, DLG_REM_OFF,
+    DLG_CHAIN = 1035, DLG_ADD_OFF, DLG_REM_OFF, DLG_BROWSE = 1041,
     // process list dialog
     PL_LIST = 1010, PL_REFRESH, PL_EDIT,
     // table/found context menu
@@ -3424,6 +3424,123 @@ static void OpenDumpDialog() {
     SetWindowLongPtrA(p, GWLP_USERDATA, 10); // mode 10 = dump picker
     ShowWindow(p, SW_SHOW);
 }
+//=================================================================
+//  Inject DLL (Tools menu, Ctrl+I) — kernel LoadLibraryW remote thread.
+//  No OpenProcess/CreateRemoteThread handles: lands on protected targets.
+//=================================================================
+// Classic usermode inject (OpenProcess + CreateRemoteThread). Reliable on
+// unprotected targets (no alertable-wait needed); protected ones refuse the
+// handle and the caller falls through to the driver APC path.
+static bool InjectClassic(DWORD pid, const std::string& dllPath, UINT64& outBase) {
+    outBase = 0;
+    HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+    if (!h || h == INVALID_HANDLE_VALUE) return false; // protected: use driver
+    wchar_t w[MAX_PATH]{};
+    MultiByteToWideChar(CP_ACP, 0, dllPath.c_str(), -1, w, MAX_PATH);
+    SIZE_T bytes = (wcslen(w) + 1) * sizeof(wchar_t);
+    LPVOID rem = VirtualAllocEx(h, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    bool ok = false;
+    if (rem && WriteProcessMemory(h, rem, w, bytes, nullptr)) {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        FARPROC ll = k32 ? GetProcAddress(k32, "LoadLibraryW") : nullptr;
+        if (ll) {
+            HANDLE th = CreateRemoteThread(h, nullptr, 0, (LPTHREAD_START_ROUTINE)ll, rem, 0, nullptr);
+            if (th) {
+                DWORD wr = WaitForSingleObject(th, 15000);
+                DWORD exit = 0;
+                if (wr == WAIT_OBJECT_0 && GetExitCodeThread(th, &exit) && exit) {
+                    const char* fn = strrchr(dllPath.c_str(), '\\'); fn = fn ? fn + 1 : dllPath.c_str();
+                    wchar_t wf[64]{}; MultiByteToWideChar(CP_ACP, 0, fn, -1, wf, 64);
+                    if (g_drv && g_attached) outBase = (UINT64)g_drv->module_base(wf);
+                    else outBase = exit;
+                    ok = (outBase != 0);
+                }
+                CloseHandle(th);
+            }
+        }
+    }
+    if (rem) VirtualFreeEx(h, rem, 0, MEM_RELEASE);
+    CloseHandle(h);
+    return ok;
+}
+static void InjectThread(std::string dllPath) {
+    HideThreadFromDebugger();
+    snprintf(g_scanMsg, sizeof(g_scanMsg), "Injecting...");
+    PostMessageA(g_hwnd, WM_SCAN_DONE, 2, 0);
+    if (!g_drv || !g_attached) { snprintf(g_scanMsg, sizeof(g_scanMsg), "Attach first"); PostMessageA(g_hwnd, WM_SCAN_DONE, 0, 0); return; }
+    wchar_t w[MAX_PATH]{};
+    MultiByteToWideChar(CP_ACP, 0, dllPath.c_str(), -1, w, MAX_PATH);
+    if (!w[0]) { snprintf(g_scanMsg, sizeof(g_scanMsg), "Bad path"); PostMessageA(g_hwnd, WM_SCAN_DONE, 0, 0); return; }
+    { // pre-flight: DLL must be 64-bit PE (target is 64-bit)
+        FILE* f = nullptr;
+        fopen_s(&f, dllPath.c_str(), "rb");
+        BYTE h[0x1000]{}; size_t n = f ? fread(h, 1, sizeof(h), f) : 0;
+        if (f) fclose(f);
+        bool ok64 = false;
+        if (n > 0x40 && h[0] == 'M' && h[1] == 'Z') {
+            uint32_t lf = 0; memcpy(&lf, h + 0x3C, 4);
+            if (lf <= (uint32_t)n - 6 && h[lf] == 'P' && h[lf + 1] == 'E') {
+                uint16_t mc = 0; memcpy(&mc, h + lf + 4, 2);
+                ok64 = (mc == 0x8664);
+            }
+        }
+        if (!ok64) { snprintf(g_scanMsg, sizeof(g_scanMsg), "DLL is not 64-bit (need x64 DLL)"); PostMessageA(g_hwnd, WM_SCAN_DONE, 0, 0); return; }
+    }
+    const char* fn0 = strrchr(dllPath.c_str(), '\\'); fn0 = fn0 ? fn0 + 1 : dllPath.c_str();
+    UINT64 cbase = 0;
+    if (InjectClassic(g_pid, dllPath, cbase) && cbase) {
+        snprintf(g_scanMsg, sizeof(g_scanMsg), "Injected %s at %llX (usermode)", fn0, (unsigned long long)cbase);
+        PostMessageA(g_hwnd, WM_SCAN_DONE, 5, 0);
+        return;
+    }
+    SSTR(_dev, _s_dev);
+    ls_driver drv(_dev, g_pid); // own handle: thread-safe
+    if (!drv.valid()) { snprintf(g_scanMsg, sizeof(g_scanMsg), "CreateFile failed"); PostMessageA(g_hwnd, WM_SCAN_DONE, 0, 0); return; }
+    LONG st = 0; UINT64 trace = 0;
+    PVOID base = drv.inject(w, &st, &trace);
+    const char* fn = strrchr(dllPath.c_str(), '\\');
+    fn = fn ? fn + 1 : dllPath.c_str();
+    const char* step = "early fail";
+    if (trace & (1ULL << 9)) step = "module found";
+    else if (trace & (1ULL << 8)) step = "loader ok";
+    else if (trace & (1ULL << 7)) step = "stub ran";
+    else if (trace & (1ULL << 6)) step = "apc queued";
+    else if (trace & (1ULL << 5)) step = "ctx set";
+    else if (trace & (1ULL << 4)) step = "got ctx";
+    else if (trace & (1ULL << 3)) step = "suspended";
+    else if (trace & (1ULL << 2)) step = "thread ok";
+    else if (trace & (1ULL << 1)) step = "apis ok";
+    else if (trace & (1ULL << 0)) step = "entered";
+    if (base) snprintf(g_scanMsg, sizeof(g_scanMsg), "Injected %s at %llX (kernel)", fn, (unsigned long long)base);
+    else if (st == (LONG)0xC0000008) snprintf(g_scanMsg, sizeof(g_scanMsg), "Attach first");
+    else if (st == (LONG)0x00000102) snprintf(g_scanMsg, sizeof(g_scanMsg), "Inject timeout t=0x%llX (%s)", trace, step);
+    else if (st == (LONG)0xC0000135) snprintf(g_scanMsg, sizeof(g_scanMsg), "LdrLoadDll: DLL or dependency not found (t=0x%llX)", trace);
+    else if (st == (LONG)0xC000007B) snprintf(g_scanMsg, sizeof(g_scanMsg), "LdrLoadDll: bitness mismatch");
+    else if (st == (LONG)0xC000007A) snprintf(g_scanMsg, sizeof(g_scanMsg), "Inject failed: LdrLoadDll not found");
+    else if (st == (LONG)0xC000000B) snprintf(g_scanMsg, sizeof(g_scanMsg), "Inject failed: target thread gone (retry?)");
+    else snprintf(g_scanMsg, sizeof(g_scanMsg), "Inject failed: 0x%08X", (unsigned)st);
+    PostMessageA(g_hwnd, WM_SCAN_DONE, 5, 0); // UI thread: refresh modules + status
+}
+static void OpenInjectDialog() {
+    if (!g_drv || !g_attached) { setStatus("Attach first"); return; }
+    if (g_dlg) { SetForegroundWindow(g_dlg); return; }
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Inject DLL", WS_POPUP | WS_CAPTION | WS_SYSMENU, 320, 230, 420, 210, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    HWND p = g_dlg;
+    auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
+        HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
+        if (g_fUI) SendMessageA(h2, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+        return h2;
+    };
+    c("STATIC", "DLL path (64-bit DLL for 64-bit target):", SS_LEFT, 12, 12, 380, 20, -1);
+    c("EDIT", "", WS_BORDER | ES_AUTOHSCROLL, 12, 36, 280, 24, DLG_ADDR_EDIT);
+    c("BUTTON", "Browse...", BS_PUSHBUTTON, 300, 35, 92, 26, DLG_BROWSE);
+    c("STATIC", "Kernel LoadLibraryW thread — no handle needed.", SS_LEFT, 12, 68, 380, 20, -1);
+    c("BUTTON", "Inject", BS_DEFPUSHBUTTON, 110, 104, 80, 28, DLG_OK_BTN);
+    c("BUTTON", "Cancel", BS_PUSHBUTTON, 210, 104, 80, 28, DLG_CANCEL_BTN);
+    SetWindowLongPtrA(p, GWLP_USERDATA, 11); // mode 11 = inject picker
+    ShowWindow(p, SW_SHOW);
+}
 static void doDumpModule(const ModInfo& m, const char* path) {
     setStatus("Dumping...");
     UINT64 base = m.base;
@@ -3609,6 +3726,19 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             EnableWindow(GetDlgItem(h, PSR_ADDR), on ? FALSE : TRUE);
             return 0;
         }
+        if (mode0 == 11 && id == DLG_BROWSE) {
+            char path[MAX_PATH]{};
+            OPENFILENAMEA of{};
+            of.lStructSize = sizeof(of);
+            of.hwndOwner = h;
+            of.lpstrFilter = "DLL (*.dll)\0*.dll\0All files (*.*)\0*.*\0";
+            of.lpstrDefExt = "dll";
+            of.lpstrFile = path;
+            of.nMaxFile = MAX_PATH;
+            of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            if (GetOpenFileNameA(&of)) SetDlgItemTextA(h, DLG_ADDR_EDIT, path);
+            return 0;
+        }
         if (id == DLG_CANCEL_BTN) { DestroyWindow(h); return 0; }
         if (id == DLG_OK_BTN) {
             LONG_PTR mode = mode0;
@@ -3758,6 +3888,16 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 of.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
                 if (!GetSaveFileNameA(&of)) return 0;
                 doDumpModule(m, path);
+                return 0;
+            }
+            if (mode == 11) {
+                // Inject picker: validate DLL -> kernel inject on a worker thread
+                std::string t = dlgText(h, DLG_ADDR_EDIT);
+                if (t.empty() || GetFileAttributesA(t.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                    setStatus("DLL not found"); SetFocus(GetDlgItem(h, DLG_ADDR_EDIT)); return 0;
+                }
+                DestroyWindow(h);
+                std::thread(InjectThread, t).detach();
                 return 0;
             }
             if (mode == 5) {
@@ -4064,6 +4204,9 @@ static HMENU BuildMenu() {
     AppendMenuA(v, MF_STRING, 9007, "Memory View");
     AppendMenuA(v, MF_STRING, 9014, "Pointer Scan");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)v, "View");
+    HMENU t = CreatePopupMenu();
+    AppendMenuA(t, MF_STRING, 9016, "Inject DLL...\tCtrl+I");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)t, "Tools");
     AppendMenuA(bar, MF_STRING, 9012, "Settings");
     HMENU h = CreatePopupMenu();
     AppendMenuA(h, MF_STRING, 9008, "About");
@@ -4172,6 +4315,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (id == 9013) PS_ForTableRow();
         else if (id == 9003) { if (!g_connected) std::thread(DriverThread).detach(); }
         else if (id == 9015) OpenDumpDialog();
+        else if (id == 9016) OpenInjectDialog();
         else if (id == IDC_FIRST_BTN || id == 9004) start_first();
         else if (id == IDC_NEXT_BTN || id == 9005) start_next();
         else if (id == IDC_UNDO_BTN || id == 9006) {
@@ -4200,7 +4344,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowTextA(ctl(IDC_START_EDIT), a);
             SetWindowTextA(ctl(IDC_STOP_EDIT), b);
         }
-        else if (id == 9008) MessageBoxA(hwnd, "LegendScan — kernel CE clone\nDriver: amdfend.sys (AMD_CrashDefend)\nBuild tag 00080003", "About", MB_OK);
+        else if (id == 9008) MessageBoxA(hwnd, "LegendScan — kernel CE clone\nDriver: amdfend.sys (AMD_CrashDefend)\nBuild tag 00080004", "About", MB_OK);
         return 0;
     }
     case WM_NOTIFY: {
@@ -4314,6 +4458,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SCAN_DONE: {
         if (wp == 1) { refresh_found(); refresh_table(); setStatus(g_scanMsg); }
         else if (wp == 3) { PS_OpenProgress(); setStatus("Pointer scan running..."); }
+        else if (wp == 5) { g_modsPid = 0; if (g_attached && g_pid) RefreshMods(g_pid); refresh_table(); setStatus(g_scanMsg); }
         else if (wp == 4) {
             if (g_psProg) { DestroyWindow(g_psProg); g_psProg = nullptr; }
             PS_OpenResults();
@@ -4397,7 +4542,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         80, 40, 800, 700, nullptr, nullptr, hInst, nullptr);
     ShowWindow(w, SW_SHOW);
     UpdateWindow(w);
+    ACCEL acc[1] = { { (BYTE)(FCONTROL | FVIRTKEY), 'I', 9016 } };
+    HACCEL hAcc = CreateAcceleratorTable(acc, 1);
     MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    while (GetMessage(&msg, nullptr, 0, 0)) {
+        if (hAcc && TranslateAccelerator(w, hAcc, &msg)) continue;
+        TranslateMessage(&msg); DispatchMessage(&msg);
+    }
+    if (hAcc) DestroyAcceleratorTable(hAcc);
     return 0;
 }

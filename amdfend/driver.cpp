@@ -20,7 +20,8 @@ constexpr ULONG ls_version_code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C7, METHOD_B
 constexpr ULONG ls_scan_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C8, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr ULONG ls_query_code   = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C9, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr ULONG ls_mods_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CA, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
-constexpr ULONG LS_BUILD_TAG    = 0x00080003; // LegendScan build: +module-enum (PEB walk, BE-proof list)
+constexpr ULONG ls_inject_code  = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CB, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+constexpr ULONG LS_BUILD_TAG    = 0x00080004; // +DLL inject (kernel LoadLibraryW remote thread)
 
 struct info_t {
     HANDLE  target_pid;
@@ -499,6 +500,398 @@ static NTSTATUS OpenTarget(HANDLE* outHandle, PEPROCESS proc) {
 }
 
 //=================================================================
+//  DLL inject — kernel LoadLibraryW remote thread (no usermode handles)
+//  Resolves the REAL LoadLibraryW in the target's kernelbase (kernel32
+//  only holds a forwarder). 64-bit targets only.
+//=================================================================
+static SIZE_T k_wcslen(const WCHAR* s) {
+    SIZE_T n = 0;
+    while (n < 260 && s[n]) n++;
+    return n;
+}
+// Export-table resolve inside target memory (attached). Forwarder RVAs refuse.
+static PVOID ResolveTargetExport(PEPROCESS proc, PVOID modBase, const char* want) {
+    if (!proc || !modBase || !want) return nullptr;
+    size_t wl = strlen(want);
+    if (!wl || wl > 64) return nullptr;
+    KAPC_STATE apc;
+    KeStackAttachProcess(proc, &apc);
+    PVOID result = nullptr;
+    __try {
+        PUCHAR b = (PUCHAR)modBase;
+        if (*(USHORT*)b != 0x5A4D) __leave;
+        ULONG lfanew = *(ULONG*)(b + 0x3C);
+        if (lfanew > 0x1000) __leave;
+        PUCHAR nt = b + lfanew;
+        if (*(ULONG*)nt != 0x00004550) __leave;
+        if (*(USHORT*)(nt + 24) != 0x20B) __leave; // 64-bit only
+        ULONG expRVA = *(ULONG*)(nt + 24 + 112);
+        ULONG expSize = *(ULONG*)(nt + 24 + 112 + 4);
+        if (!expRVA || !expSize || expSize > 0x100000) __leave;
+        PUCHAR exp = b + expRVA;
+        ULONG nNames = *(ULONG*)(exp + 24);
+        ULONG addrFns = *(ULONG*)(exp + 28);
+        ULONG addrNames = *(ULONG*)(exp + 32);
+        ULONG addrOrds = *(ULONG*)(exp + 36);
+        if (!nNames || nNames > 20000) __leave;
+        for (ULONG i = 0; i < nNames; i++) {
+            ULONG nameRVA = *(ULONG*)(b + addrNames + (SIZE_T)i * 4);
+            if (!nameRVA || nameRVA > 0x10000000) continue;
+            char* nm = (char*)(b + nameRVA);
+            SIZE_T k = 0;
+            for (; k < wl; k++) if (nm[k] != want[k]) break;
+            if (k != wl || nm[wl] != 0) continue;
+            USHORT ord = *(USHORT*)(b + addrOrds + (SIZE_T)i * 2);
+            ULONG fnRVA = *(ULONG*)(b + addrFns + (SIZE_T)ord * 4);
+            if (!fnRVA || fnRVA > 0x10000000) break;
+            if (fnRVA >= expRVA && fnRVA < expRVA + expSize) break; // forwarder: refuse
+            result = (PVOID)(b + fnRVA);
+            break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { result = nullptr; }
+    KeUnstackDetachProcess(&apc);
+    return result;
+}
+
+static VOID FreeRemoteMem(HANDLE hProc, PVOID addr) {
+    if (!hProc || !addr) return;
+    UNICODE_STRING zfn; RtlInitUnicodeString(&zfn, L"ZwFreeVirtualMemory");
+    auto pFree = (ZwFreeVirtualMemory_t)MmGetSystemRoutineAddress(&zfn);
+    if (pFree) { PVOID b = addr; SIZE_T s = 0; pFree(hProc, &b, &s, MEM_RELEASE); }
+}
+
+// ZwCreateThreadEx: undocumented, resolve dynamically (present on Win10+).
+// Creates a USER thread in the target — the thread starts through the normal
+// usermode path, so kCFG never sees a kernel guarded-icall into usermode.
+typedef NTSTATUS(NTAPI* ZwCreateThreadEx_t)(
+    PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, HANDLE ProcessHandle,
+    PVOID StartRoutine, PVOID Argument, ULONG CreateFlags,
+    SIZE_T ZeroBits, SIZE_T StackSize, SIZE_T MaximumStackSize, PVOID AttributeList);
+
+// NOTE: ntoskrnl does NOT export Zw/NtCreateThreadEx (verified via dumpbin),
+// so injection uses a user-mode APC instead (KeInsertQueueApc with
+// NormalRoutine=LoadLibraryW into the main thread). Same kCFG-safe property:
+// delivery runs LoadLibraryW in usermode, never through a kernel guarded call.
+
+// LdrLoadDll stub injection (KMDllInjector-proven shape): the APC carries a
+// tiny RWX stub that calls ntdll!LdrLoadDll and records executed + NTSTATUS.
+// This separates "APC never fired" (target never alerted) from "DLL failed"
+// (bitness/deps, with the loader's exact code).
+struct InjArgs {
+    PVOID ldrLoadDll;     // +0
+    WCHAR path[260];      // +8
+    USHORT usLen;         // +528
+    USHORT usMax;         // +530
+    ULONG _pad;           // +532
+    PVOID usBuf;          // +536
+    PVOID hMod;           // +544 (HANDLE)
+    LONG executed;        // +552
+    LONG status;          // +556 (NTSTATUS from LdrLoadDll)
+    PVOID origRip;        // +560 (hijack resume point)
+}; // 568 bytes
+// rcx = &InjArgs. Saves flags+volatiles, LdrLoadDll(NULL, 0, &us, &hMod),
+// restores everything (RAX=origRip), jmp origRip.
+static const UCHAR kInjStub[] = {
+    0x9C,                                                 // pushfq
+    0x50, 0x51, 0x52,                                     // push rax,rcx,rdx
+    0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,       // push r8-r11
+    0x49, 0x89, 0xCA,                                     // mov r10, rcx
+    0xC7, 0x81, 0x28, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov dword [rcx+552], 1
+    0x48, 0x83, 0xEC, 0x28,                               // sub rsp, 0x28
+    0x31, 0xC9,                                           // xor ecx, ecx
+    0x31, 0xD2,                                           // xor edx, edx
+    0x4D, 0x8D, 0x82, 0x10, 0x02, 0x00, 0x00,             // lea r8, [r10+528]
+    0x4D, 0x8D, 0x8A, 0x20, 0x02, 0x00, 0x00,             // lea r9, [r10+544]
+    0x49, 0x8B, 0x02,                                     // mov rax, [r10]
+    0xFF, 0xD0,                                           // call rax
+    0x41, 0x89, 0x82, 0x2C, 0x02, 0x00, 0x00,             // mov [r10+556], eax
+    0x48, 0x83, 0xC4, 0x28,                               // add rsp, 0x28
+    0x49, 0x8B, 0x82, 0x30, 0x02, 0x00, 0x00,             // mov rax, [r10+560]
+    0x48, 0x89, 0x44, 0x24, 0x30,                         // mov [rsp+48], rax
+    0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,       // pop r11,r10,r9,r8
+    0x5A, 0x59, 0x58,                                     // pop rdx,rcx,rax(=orig)
+    0x9D,                                                 // popfq
+    0xFF, 0xE0                                            // jmp rax
+};
+#define LS_INJ_STUB_SZ 128
+typedef VOID(NTAPI* KeAlertThread_t)(PKTHREAD Thread, KPROCESSOR_MODE AlertMode);
+
+// Suspend/context APIs: verified exported via dumpbin; signatures confirmed
+// against disassembly (Suspend/Resume take PEPROCESS only; Get/Set take
+// Thread+Context+Mode). Resolved dynamically: zero link risk.
+typedef NTSTATUS(NTAPI* PsSuspendProcess_t)(PEPROCESS Process);
+typedef NTSTATUS(NTAPI* PsResumeProcess_t)(PEPROCESS Process);
+typedef NTSTATUS(NTAPI* PsGetContextThread_t)(PETHREAD Thread, PVOID Context, KPROCESSOR_MODE Mode);
+typedef NTSTATUS(NTAPI* PsSetContextThread_t)(PETHREAD Thread, PVOID Context, KPROCESSOR_MODE Mode);
+#define LS_CTX_SIZE 1232      // sizeof(CONTEXT) x64
+#define LS_CTX_FLAGS_OFF 48   // ContextFlags
+#define LS_CTX_RCX_OFF 128
+#define LS_CTX_RIP_OFF 248
+#define LS_CONTEXT_FULL 0x10000B
+
+// Local APC import declarations (this WDK config doesn't expose them via
+// ntddk.h — declare directly). x64 KAPC = 0x58 bytes (Type..Inserted;
+// ApcStateIndex/ApcMode/Inserted live at +80..82 — a short alloc breaks
+// KeInsertQueueApc AND overruns the pool).
+#define LS_KAPC_SIZE 0x58
+EXTERN_C NTKERNELAPI VOID NTAPI KeInitializeApc(
+    PVOID Apc, PVOID Thread, INT Environment,
+    PVOID KernelRoutine, PVOID RundownRoutine, PVOID NormalRoutine,
+    KPROCESSOR_MODE ApcMode, PVOID NormalContext);
+EXTERN_C NTKERNELAPI BOOLEAN NTAPI KeInsertQueueApc(
+    PVOID Apc, PVOID SystemArgument1, PVOID SystemArgument2, UCHAR Increment);
+
+extern "C" {
+    NTKERNELAPI HANDLE NTAPI PsGetProcessId(PEPROCESS Process);
+    NTKERNELAPI NTSTATUS NTAPI PsLookupThreadByThreadId(HANDLE ThreadId, PETHREAD* Thread);
+}
+
+static VOID NTAPI InjectApcKernel(PVOID Apc, PVOID NormalRoutine,
+    PVOID NormalContext, PVOID SystemArgument1, PVOID SystemArgument2) {
+    UNREFERENCED_PARAMETER(Apc); UNREFERENCED_PARAMETER(NormalRoutine);
+    UNREFERENCED_PARAMETER(NormalContext);
+    UNREFERENCED_PARAMETER(SystemArgument1); UNREFERENCED_PARAMETER(SystemArgument2);
+    // delivery vehicle only — real work happens in usermode NormalRoutine
+}
+static VOID NTAPI InjectApcRundown(PVOID Apc) {
+    if (Apc) ExFreePoolWithTag(Apc, 'LSap'); // thread died with APC pending
+}
+
+// First-thread TIDs of a PID via SystemProcessInformation (x64 offsets:
+// Threads[] @ +256, stride 80, ClientId.UniqueThread @ +48 within).
+// Queues to several threads: whichever alerts first runs LoadLibrary
+// (ref-counted, harmless if more than one fires).
+static int FindTargetTids(HANDLE pidH, HANDLE* out, int max) {
+    if (!pidH || !out || max <= 0) return 0;
+    int n = 0;
+    ULONG needed = 0;
+    ZwQuerySystemInformation((SYSTEM_INFORMATION_CLASS)5, nullptr, 0, &needed);
+    if (!needed || needed > 0x2000000) return 0;
+    PVOID buf = ExAllocatePoolWithTag(NonPagedPool, needed + 0x1000, 'LSth');
+    if (!buf) return 0;
+    __try {
+        if (NT_SUCCESS(ZwQuerySystemInformation((SYSTEM_INFORMATION_CLASS)5, buf, needed + 0x1000, nullptr))) {
+            PUCHAR e = (PUCHAR)buf;
+            for (;;) {
+                HANDLE ep = *(HANDLE*)(e + 80); // UniqueProcessId
+                if (ep == pidH) {
+                    ULONG nTh = *(ULONG*)(e + 4);
+                    for (ULONG i = 0; i < nTh && n < max; i++) {
+                        HANDLE tid = *(HANDLE*)(e + 256 + (SIZE_T)i * 80 + 48);
+                        if (tid) out[n++] = tid;
+                    }
+                    break;
+                }
+                ULONG next = *(ULONG*)e;
+                if (!next) break;
+                e += next;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    ExFreePoolWithTag(buf, 'LSth');
+    return n;
+}
+// First thread (main thread) of a PID via SystemProcessInformation (x64 offsets).
+static BOOLEAN FindMainThreadId(HANDLE pidH, HANDLE* outTid) {
+    HANDLE t = nullptr;
+    if (FindTargetTids(pidH, &t, 1) < 1) return FALSE;
+    if (outTid) *outTid = t;
+    return TRUE;
+}
+
+static NTSTATUS KernelInjectDll(PEPROCESS proc, const WCHAR* dllPath, PVOID* outBase, UINT64* outTrace) {
+    UINT64 trace = 0;
+#define INJ_T(b) do { trace |= (1ULL << (b)); } while (0)
+#define INJ_RET(x) do { if (outTrace) *outTrace = trace; return (x); } while (0)
+    // bits: 0=entered 1=apis 2=thread 3=suspended 4=gotctx 5=setctx 6=apc
+    //       7=exec 8=ldrok 9=module
+    if (outBase) *outBase = nullptr;
+    if (!proc || !dllPath) INJ_RET(STATUS_INVALID_PARAMETER);
+    INJ_T(0);
+    WCHAR path[260]{};
+    SIZE_T pl = k_wcslen(dllPath);
+    if (!pl || pl > 259) INJ_RET(STATUS_INVALID_PARAMETER);
+    for (SIZE_T i = 0; i < pl; i++) path[i] = dllPath[i];
+    const WCHAR* fn = path;
+    for (const WCHAR* p = path; *p; p++) if (*p == L'\\' || *p == L'/') fn = p + 1;
+    if (!*fn) INJ_RET(STATUS_INVALID_PARAMETER);
+    // LdrLoadDll lives in ntdll (implemented there — no forwarder games).
+    // We call it through a tiny RWX stub so we get its exact NTSTATUS back
+    // (deps missing? bitness?) instead of LoadLibraryW's bare NULL.
+    PVOID nt = GetModuleBaseAddress(proc, L"ntdll.dll");
+    if (!nt) INJ_RET(STATUS_DLL_NOT_FOUND);
+    PVOID ldrLoadDll = ResolveTargetExport(proc, nt, "LdrLoadDll");
+    if (!ldrLoadDll) INJ_RET(STATUS_PROCEDURE_NOT_FOUND);
+    {
+        // sanity: must be a canonical usermode RX address, never kernel
+        ULONG_PTR la = (ULONG_PTR)ldrLoadDll;
+        constexpr ULONG_PTR kMaxUser = 0x7FFFFFFFFFFFULL;
+        if (la < 0x10000 || la > kMaxUser) INJ_RET(STATUS_PROCEDURE_NOT_FOUND);
+    }
+    HANDLE hProc = nullptr;
+    NTSTATUS st = OpenTarget(&hProc, proc);
+    if (!NT_SUCCESS(st)) INJ_RET(st);
+    // args page (RW) + stub page (RWX) in target
+    PVOID rArgs = nullptr;
+    SIZE_T asz = sizeof(InjArgs);
+    st = ZwAllocateVirtualMemory(hProc, &rArgs, 0, &asz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!NT_SUCCESS(st) || !rArgs) { ZwClose(hProc); INJ_RET(NT_SUCCESS(st) ? STATUS_UNSUCCESSFUL : st); }
+    PVOID rStub = nullptr;
+    SIZE_T ssz = LS_INJ_STUB_SZ;
+    st = ZwAllocateVirtualMemory(hProc, &rStub, 0, &ssz, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!NT_SUCCESS(st) || !rStub) { FreeRemoteMem(hProc, rArgs); ZwClose(hProc); INJ_RET(NT_SUCCESS(st) ? STATUS_UNSUCCESSFUL : st); }
+    {
+        InjArgs a{};
+        a.ldrLoadDll = ldrLoadDll;
+        for (SIZE_T i = 0; i < pl; i++) a.path[i] = path[i];
+        a.usLen = (USHORT)(pl * sizeof(WCHAR));
+        a.usMax = (USHORT)sizeof(a.path);
+        a.usBuf = (PVOID)((ULONG_PTR)rArgs + 8);
+        // hMod/executed/status already zero
+        KAPC_STATE apc2;
+        KeStackAttachProcess(proc, &apc2);
+        __try {
+            RtlCopyMemory(rArgs, &a, sizeof(a));
+            RtlCopyMemory(rStub, kInjStub, sizeof(kInjStub));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { st = GetExceptionCode(); }
+        KeUnstackDetachProcess(&apc2);
+        if (!NT_SUCCESS(st)) { FreeRemoteMem(hProc, rStub); FreeRemoteMem(hProc, rArgs); ZwClose(hProc); INJ_RET(st); }
+    }
+    // kernel handle for the thread: Ob* + Zw* stay in one consistent domain.
+    // NOTE: must NOT be a SYSTEM thread (PsCreateSystemThread starts via
+    // PspSystemThreadStartup's kernel guarded-icall, and kCFG bugchecks
+    // 0x139 guard_icall_bugcheck on usermode targets — proven by dump).
+    // And ntoskrnl exports no Zw/NtCreateThreadEx.
+    // PRIMARY: hijack (deterministic, needs no alertable wait): suspend
+    // process -> main-thread Rip=stub, Rcx=args -> resume. Stub restores
+    // regs/flags and jmps back to origRip. FALLBACK: one user-mode APC, used
+    // ONLY when hijack didn't apply — never both (a stale second run would
+    // jmp to a dead resume point).
+    bool hijacked = false;
+    {
+        UNICODE_STRING s1, s2, s3, s4;
+        RtlInitUnicodeString(&s1, L"PsSuspendProcess");
+        RtlInitUnicodeString(&s2, L"PsResumeProcess");
+        RtlInitUnicodeString(&s3, L"PsGetContextThread");
+        RtlInitUnicodeString(&s4, L"PsSetContextThread");
+        auto pSusp = (PsSuspendProcess_t)MmGetSystemRoutineAddress(&s1);
+        auto pResm = (PsResumeProcess_t)MmGetSystemRoutineAddress(&s2);
+        auto pGetC = (PsGetContextThread_t)MmGetSystemRoutineAddress(&s3);
+        auto pSetC = (PsSetContextThread_t)MmGetSystemRoutineAddress(&s4);
+        if (pSusp && pResm && pGetC && pSetC) {
+            INJ_T(1);
+            PETHREAD th = nullptr;
+            HANDLE mtid = nullptr;
+            if (FindMainThreadId(PsGetProcessId(proc), &mtid) && mtid &&
+                NT_SUCCESS(PsLookupThreadByThreadId(mtid, &th)) && th) {
+                INJ_T(2);
+                if (NT_SUCCESS(pSusp(proc))) {
+                    INJ_T(3);
+                    UCHAR ctx[LS_CTX_SIZE]{};
+                    *(ULONG*)(ctx + LS_CTX_FLAGS_OFF) = LS_CONTEXT_FULL;
+                    if (NT_SUCCESS(pGetC(th, ctx, UserMode))) {
+                        UINT64 origRip = 0;
+                        memcpy(&origRip, ctx + LS_CTX_RIP_OFF, 8);
+                        if (origRip) {
+                            INJ_T(4);
+                            KAPC_STATE apc3;
+                            KeStackAttachProcess(proc, &apc3);
+                            __try {
+                                RtlCopyMemory((PVOID)((ULONG_PTR)rArgs + 560), &origRip, 8);
+                                memcpy(ctx + LS_CTX_RIP_OFF, &rStub, 8);
+                                memcpy(ctx + LS_CTX_RCX_OFF, &rArgs, 8);
+                            }
+                            __except (EXCEPTION_EXECUTE_HANDLER) {}
+                            KeUnstackDetachProcess(&apc3);
+                            if (NT_SUCCESS(pSetC(th, ctx, UserMode))) INJ_T(5);
+                            hijacked = (trace & (1ULL << 5)) != 0;
+                        }
+                    }
+                    pResm(proc); // ALWAYS resume — never leave the game frozen
+                }
+                ObDereferenceObject(th);
+            }
+        }
+    }
+    if (!hijacked) {
+    HANDLE tid = nullptr;
+    if (!FindMainThreadId(PsGetProcessId(proc), &tid) || !tid) {
+        FreeRemoteMem(hProc, rStub); FreeRemoteMem(hProc, rArgs);
+        ZwClose(hProc);
+        INJ_RET(STATUS_NOT_FOUND);
+    }
+    PETHREAD th = nullptr;
+    if (!NT_SUCCESS(PsLookupThreadByThreadId(tid, &th)) || !th) {
+        FreeRemoteMem(hProc, rStub); FreeRemoteMem(hProc, rArgs);
+        ZwClose(hProc);
+        INJ_RET(STATUS_NOT_FOUND);
+    }
+    PVOID apc = ExAllocatePoolWithTag(NonPagedPool, LS_KAPC_SIZE, 'LSap');
+    if (!apc) {
+        ObDereferenceObject(th);
+        FreeRemoteMem(hProc, rStub); FreeRemoteMem(hProc, rArgs);
+        ZwClose(hProc);
+        INJ_RET(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    KeInitializeApc(apc, (PVOID)th, 0 /*OriginalApcEnvironment*/,
+        (PVOID)InjectApcKernel, (PVOID)InjectApcRundown, rStub, UserMode, rArgs);
+    if (!KeInsertQueueApc(apc, nullptr, nullptr, 0)) {
+        ExFreePoolWithTag(apc, 'LSap'); // never queued: rundown won't run
+        ObDereferenceObject(th);
+        FreeRemoteMem(hProc, rStub); FreeRemoteMem(hProc, rArgs);
+        ZwClose(hProc);
+        INJ_RET(STATUS_UNSUCCESSFUL);
+    }
+    INJ_T(6);
+    ObDereferenceObject(th); // APC now holds its own thread reference
+    // poke alertable waiters so delivery doesn't wait for the next wait call
+    {
+        UNICODE_STRING an; RtlInitUnicodeString(&an, L"KeAlertThread");
+        auto pAlert = (KeAlertThread_t)MmGetSystemRoutineAddress(&an);
+        if (pAlert) {
+            PETHREAD th2 = nullptr;
+            if (NT_SUCCESS(PsLookupThreadByThreadId(tid, &th2)) && th2) {
+                __try { pAlert((PKTHREAD)th2, UserMode); }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+                ObDereferenceObject(th2);
+            }
+        }
+    }
+    // NOTE: KAPC intentionally not freed on success (no owner after delivery).
+    } // end APC fallback
+    // Poll stub's executed/status: separates "APC never fired" (STATUS_TIMEOUT)
+    // from "LdrLoadDll failed" (exact loader code: bitness/deps).
+    LONG exec = 0, ldrSt = 0;
+    for (int i = 0; i < 20 && !exec; i++) {
+        LARGE_INTEGER dly; dly.QuadPart = -5000000LL; // 500ms
+        KeDelayExecutionThread(KernelMode, FALSE, &dly);
+        UCHAR s[8]{}; SIZE_T got = 0;
+        if (NT_SUCCESS(SafeCopy(proc, (PVOID)((ULONG_PTR)rArgs + 552), PsGetCurrentProcess(), s, 8, &got)) && got == 8) {
+            memcpy(&exec, s, 4); memcpy(&ldrSt, s + 4, 4);
+        }
+    }
+    if (!exec) {
+        // leak both pages: the APC may still fire later (timeout beats UAF)
+        ZwClose(hProc);
+        INJ_RET(STATUS_TIMEOUT);
+    }
+    INJ_T(7);
+    if (!NT_SUCCESS((NTSTATUS)ldrSt)) {
+        FreeRemoteMem(hProc, rStub); FreeRemoteMem(hProc, rArgs);
+        ZwClose(hProc);
+        INJ_RET((NTSTATUS)ldrSt);
+    }
+    INJ_T(8);
+    PVOID mb = GetModuleBaseAddress(proc, fn);
+    if (mb) { INJ_T(9); FreeRemoteMem(hProc, rStub); FreeRemoteMem(hProc, rArgs); }
+    if (outBase) *outBase = mb;
+    ZwClose(hProc);
+    INJ_RET(mb ? STATUS_SUCCESS : STATUS_DLL_NOT_FOUND);
+}
+
+//=================================================================
 //  Kernel scan — chunked read + masked compare, overlap-safe
 //=================================================================
 #define LS_SCAN_CHUNK 0x10000  // 64KB per copy
@@ -737,6 +1130,22 @@ NTSTATUS ctl_io(PDEVICE_OBJECT dev, PIRP irp) {
         ObDereferenceObject(proc);
         req->count = found;
         status = STATUS_SUCCESS;
+        break;
+    }
+    case ls_inject_code: {
+        if (!sysbuf || inLen < sizeof(info_t) || outLen < sizeof(info_t)) { status = STATUS_INVALID_PARAMETER; break; }
+        auto buf = (info_t*)sysbuf;
+        if (!buf->module_name[0]) { status = STATUS_INVALID_PARAMETER; break; }
+        PEPROCESS proc = AcquireTargetRef();
+        if (!proc) { status = STATUS_INVALID_HANDLE; break; }
+        PVOID loaded = nullptr;
+        UINT64 trace = 0;
+        NTSTATUS ist = KernelInjectDll(proc, buf->module_name, &loaded, &trace);
+        buf->base_address = loaded;
+        buf->return_size = (SIZE_T)ist; // real NTSTATUS for usermode messages
+        buf->size = (SIZE_T)trace;      // step trace (size unused for inject)
+        ObDereferenceObject(proc);
+        status = STATUS_SUCCESS; // transport OK: guarantees output copy-back
         break;
     }
     case ls_query_code: {

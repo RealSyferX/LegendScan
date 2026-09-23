@@ -32,7 +32,7 @@
 
 Auto (recommended): just run `x64\Release\Scanner.exe` **as Administrator** —
 it runs `EfiDSEFix -d` → `Loader.exe amdfend.sys --no-dsefix --keep` → `-e`
-by itself and polls `\\.\AMD_CrashDefend` until `Driver OK v00080002`.
+by itself and polls `\\.\AMD_CrashDefend` until `Driver OK v00080004`.
 
 Manual (Admin CMD, from `x64\Release\`):
 
@@ -70,6 +70,7 @@ Same recipe as DesAnime (`Install.md` §3b): mount ESP, copy
 
 ## 5. Version tags
 
-- Driver `LS_BUILD_TAG` / Scanner check: current `0x00080003`
+- Driver `LS_BUILD_TAG` / Scanner check: current `0x00080004`
+  (inject + module-enum). Scanner warns `(update!)`
   (MDL write fallback + kernel module-enum). Scanner warns `(update!)`
   on mismatch — always run matched pairs from the same build.

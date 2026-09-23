@@ -51,12 +51,16 @@ from usermode. Kernel-side AOB/value scan = DMA-style speed without hardware.
   patched `DbgBreakPoint`, random window classes/cover captions
 - **Writes that land** — driver `MdlWrite` fallback handles `PAGE_READONLY`
   pages `MmCopyVirtualMemory` refuses; every write is read-back verified
+- **Dump Process** — Process → Dump Process: KsDumper-style PE rebuild
+  (headers + sections, IAT/bound-import hygiene) via driver reads, no handles
+- **Inject DLL** — Tools → Inject DLL (`Ctrl+I`): kernel `LoadLibraryW`
+  remote thread (kernelbase resolve), zero usermode handles
 
 ## Quick start
 
 1. Build `LegendScan.sln` → **Release x64** (see [Install.md](Install.md))
 2. Boot EfiGuard, run `x64\Release\Scanner.exe` **as Administrator**
-   (auto-loads the driver — wait for `Driver OK v00080003`)
+   (auto-loads the driver — wait for `Driver OK v00080004`)
 3. PC → pick process → First Scan → change value in game → Next Scan →
    double-click hit → tick Active to freeze (see [Guide.md](Guide.md))
 
@@ -74,7 +78,7 @@ Loader/    driver loader (main.cpp)
 x64/Release/  build outputs: Scanner.exe, Loader.exe, amdfend.sys (+ EfiDSEFix.exe)
 ```
 
-## Driver IOCTLs (`0x19C1`–`0x19CA`, build tag `0x00080003`)
+## Driver IOCTLs (`0x19C1`–`0x19CB`, build tag `0x00080004`)
 
 | Code | Op | Notes |
 | ---- | -- | ----- |
@@ -87,6 +91,7 @@ x64/Release/  build outputs: Scanner.exe, Loader.exe, amdfend.sys (+ EfiDSEFix.e
 | `0x19C8` | scan | masked pattern scan, 64 KB chunks, 256 hits max |
 | `0x19C9` | query | `ZwQueryVirtualMemory` region info (for region walk) |
 | `0x19CA` | mods | full PEB/LDR walk — module list even when Toolhelp is stripped (BE) |
+| `0x19CB` | inject | kernel LoadLibraryW remote thread — DLL inject, zero usermode handles |
 
 Stealth: PiDDB wipe (`amdfend.sys`), `MmUnloadedDrivers` scrub,
 SecureBoot/TPM spoof, ETW + ETW-TI patch, `MmCopyVirtualMemory` trampoline,

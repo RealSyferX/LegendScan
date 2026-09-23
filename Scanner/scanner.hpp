@@ -18,7 +18,8 @@ constexpr DWORD ls_version_code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C7, METHOD_B
 constexpr DWORD ls_scan_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C8, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr DWORD ls_query_code   = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C9, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr DWORD ls_mods_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CA, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
-constexpr DWORD LS_BUILD_TAG    = 0x00080003;
+constexpr DWORD ls_inject_code  = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CB, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+constexpr DWORD LS_BUILD_TAG    = 0x00080004;
 
 #define LS_MODS_MAX 128
 struct ls_kmod_t {
@@ -274,6 +275,19 @@ public:
         io.size = sz;
         DWORD br = 0;
         if (!DeviceIoControl(m_h, ls_alloc_code, &io, sizeof(io), &io, sizeof(io), &br, nullptr)) return nullptr;
+        return io.base_address;
+    }
+    // Kernel LdrLoadDll-stub injection. Returns loaded module base (NULL on
+    // fail), NTSTATUS via stOut, step-trace via traceOut (bits: 0=entered
+    // 1=apis 2=thread 3=suspended 4=gotctx 5=setctx 6=apc 7=exec 8=ldrok 9=module).
+    PVOID inject(const WCHAR* dllPath, LONG* stOut = nullptr, UINT64* traceOut = nullptr) {
+        ls_info_t io{};
+        wcsncpy_s(io.module_name, dllPath, 259);
+        DWORD br = 0;
+        BOOL ok = DeviceIoControl(m_h, ls_inject_code, &io, sizeof(io), &io, sizeof(io), &br, nullptr);
+        if (stOut) *stOut = ok ? (LONG)(LONG_PTR)io.return_size : (LONG)GetLastError();
+        if (traceOut) *traceOut = ok ? io.size : 0;
+        if (!ok) return nullptr;
         return io.base_address;
     }
 };

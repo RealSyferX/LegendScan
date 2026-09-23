@@ -4,7 +4,7 @@
 
 1. Boot EfiGuard (USB or AnimeMode entry)
 2. Run `x64\Release\Scanner.exe` **as Administrator**
-3. Wait for **`Driver OK v00080003`** in the status bar
+3. Wait for **`Driver OK v00080004`** in the status bar
 4. PC → attach target → scan
 
 > The driver stays loaded (`--keep`) after Scanner closes. After a driver
@@ -93,6 +93,11 @@ hex-string box → **Write** (verified, MDL fallback covers read-only pages).
   Level 1 = holders pointing straight at your address; each level walks
   one hop further back until a static module closes the path.
 - **Static**: Change Address → `"game.exe"+DA059C` → OK → survives restart.
+- **Dump**: Process → Dump Process → pick module → save `.exe`/`.dll` —
+  KsDumper-style rebuild from driver reads (imports not rebuilt: for IDA, not run).
+- **Inject**: Tools → Inject DLL (`Ctrl+I`) → Browse 64-bit DLL → Inject —
+  kernel `LoadLibraryW` thread, lands even on stripped-handle targets.
+  64-bit DLL for 64-bit target.
 
 ## Safety rules
 
