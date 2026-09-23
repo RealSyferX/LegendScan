@@ -162,6 +162,28 @@ public:
         if (!read_raw(addr, out, sz)) return false;
         return true;
     }
+    // Bulk read: ONE ioctl per 1MB chunk (driver MmCopy handles any size).
+    // read_raw loops 8-byte IOCTLs — far too slow for MB-scale dumps.
+    bool read_bulk(UINT64 addr, void* out, SIZE_T sz) {
+        if (!sz) return true;
+        BYTE* dst = (BYTE*)out;
+        SIZE_T done = 0;
+        while (done < sz) {
+            SIZE_T want = sz - done;
+            if (want > 0x100000) want = 0x100000;
+            if (!is_user_range(addr + done, want)) return false;
+            ls_info_t io{};
+            io.target_address = addr + done;
+            io.buffer_address = (UINT64)(dst + done);
+            io.size = want;
+            DWORD br = 0;
+            if (!DeviceIoControl(m_h, ls_read_code, &io, sizeof(io), &io, sizeof(io), &br, nullptr)) return false;
+            if (io.return_size == 0 || io.return_size > want) return false;
+            done += io.return_size;
+            if (io.return_size < want) break; // partial: stop here
+        }
+        return done == sz;
+    }
     bool write_bytes(UINT64 addr, const void* data, SIZE_T sz) {
         if (!is_user_range(addr, sz)) return false;
         const BYTE* src = (const BYTE*)data;

@@ -3367,6 +3367,204 @@ static LRESULT CALLBACK PSResProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 //=================================================================
+//  Dump Process (KsDumper-style) — PE rebuild from driver reads.
+//  Zero usermode handles: works on protected targets. Import table
+//  is NOT rebuilt (same limitation as KsDumper).
+//=================================================================
+static std::vector<ModInfo> g_dumpMods;
+// Best-effort page-granular read: unreadable pages stay zeroed, dump continues.
+static SIZE_T dump_read_best(UINT64 addr, BYTE* dst, SIZE_T sz) {
+    if (!g_drv || !g_attached || !dst) return 0;
+    memset(dst, 0, sz);
+    SIZE_T done = 0;
+    std::vector<BYTE> tmp;
+    tmp.resize(0x1000);
+    while (done < sz) {
+        UINT64 cur = addr + done;
+        SIZE_T want = (std::min<SIZE_T>)(0x1000, sz - done);
+        SIZE_T pg = (SIZE_T)(cur & 0xFFF);
+        if (pg + want > 0x1000) want = 0x1000 - pg; // never cross pages
+        if (g_drv->read_bulk(cur, tmp.data(), want)) memcpy(dst + done, tmp.data(), want);
+        done += want;
+    }
+    return done;
+}
+static void doDumpModule(const ModInfo& m, const char* path);
+static void OpenDumpDialog() {
+    if (!g_drv || !g_attached) { setStatus("Attach first"); return; }
+    if (g_dlg) { SetForegroundWindow(g_dlg); return; }
+    RefreshMods(g_pid);
+    g_dumpMods = g_mods;
+    if (g_dumpMods.empty()) { setStatus("No modules (protected target?)"); return; }
+    int def = -1;
+    for (size_t i = 0; i < g_dumpMods.size(); i++)
+        if (_stricmp(g_dumpMods[i].name.c_str(), g_proc) == 0) { def = (int)i; break; }
+    if (def < 0) {
+        UINT64 lb = ~0ULL;
+        for (size_t i = 0; i < g_dumpMods.size(); i++)
+            if (g_dumpMods[i].base && g_dumpMods[i].base < lb) { lb = g_dumpMods[i].base; def = (int)i; }
+    }
+    if (def < 0) def = 0;
+    g_dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, g_clsDlg, "Dump Process", WS_POPUP | WS_CAPTION | WS_SYSMENU, 340, 240, 400, 175, g_hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    HWND p = g_dlg;
+    auto c = [&](const char* cls, const char* t, DWORD st, int x, int y, int w, int h, int id) {
+        HWND h2 = CreateWindowExA(0, cls, t, st | WS_CHILD | WS_VISIBLE, x, y, w, h, p, (HMENU)(INT_PTR)id, GetModuleHandleA(nullptr), nullptr);
+        if (g_fUI) SendMessageA(h2, WM_SETFONT, (WPARAM)g_fUI, TRUE);
+        return h2;
+    };
+    c("STATIC", "Module:", SS_LEFT, 12, 14, 60, 20, -1);
+    HWND cb = c("COMBOBOX", "", WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL, 12, 36, 360, 220, DLG_TYPE_CB);
+    for (auto& mm : g_dumpMods) {
+        char it[160]; snprintf(it, sizeof(it), "%s  [%llX]", mm.name.c_str(), (unsigned long long)mm.base);
+        SendMessageA(cb, CB_ADDSTRING, 0, (LPARAM)it);
+    }
+    SendMessageA(cb, CB_SETCURSEL, def, 0);
+    c("BUTTON", "OK", BS_DEFPUSHBUTTON, 110, 88, 80, 28, DLG_OK_BTN);
+    c("BUTTON", "Cancel", BS_PUSHBUTTON, 210, 88, 80, 28, DLG_CANCEL_BTN);
+    SetWindowLongPtrA(p, GWLP_USERDATA, 10); // mode 10 = dump picker
+    ShowWindow(p, SW_SHOW);
+}
+static void doDumpModule(const ModInfo& m, const char* path) {
+    setStatus("Dumping...");
+    UINT64 base = m.base;
+    { UINT64 live = mod_base(m.name.c_str()); if (live) base = live; } // ASLR-fresh
+    if (!base) { setStatus("Module base gone (re-attach?)"); return; }
+    std::vector<BYTE> h1(0x1000);
+    if (!g_drv->read_bulk(base, h1.data(), h1.size())) { setStatus("Dump: cannot read headers"); return; }
+    auto u16 = [&](size_t o) -> uint16_t { uint16_t v = 0; if (o + 2 <= h1.size()) memcpy(&v, h1.data() + o, 2); return v; };
+    auto u32 = [&](size_t o) -> uint32_t { uint32_t v = 0; if (o + 4 <= h1.size()) memcpy(&v, h1.data() + o, 4); return v; };
+    if (u16(0) != 0x5A4D) { setStatus("Dump: bad MZ"); return; }
+    uint32_t lf = u32(0x3C);
+    if (!lf || lf > 0x10000) { setStatus("Dump: bad e_lfanew"); return; }
+    uint32_t need = lf + 4 + 20 + 240 + 96 * 40 + 16;
+    std::vector<BYTE> hdr;
+    if (need <= h1.size()) hdr.assign(h1.begin(), h1.end());
+    else { hdr.resize(need); if (dump_read_best(base, hdr.data(), need) != need) { setStatus("Dump: header read failed"); return; } }
+    auto h32 = [&](size_t o) -> uint32_t { uint32_t v = 0; if (o + 4 <= hdr.size()) memcpy(&v, hdr.data() + o, 4); return v; };
+    if (h32(lf) != 0x00004550) { setStatus("Dump: bad PE sig"); return; }
+    size_t fh = (size_t)lf + 4;
+    uint16_t nSec = 0, optSz = 0;
+    memcpy(&nSec, hdr.data() + fh + 2, 2); memcpy(&optSz, hdr.data() + fh + 16, 2);
+    if (!nSec || nSec > 96) { setStatus("Dump: bad section count"); return; }
+    size_t oh = fh + 20;
+    if (oh + 64 > hdr.size()) { setStatus("Dump: truncated headers"); return; }
+    uint16_t magic = 0; memcpy(&magic, hdr.data() + oh, 2);
+    if (magic != 0x10B && magic != 0x20B) { setStatus("Dump: bad optional magic"); return; }
+    uint32_t sizeHdr = 0, fileAlign = 0, sizeImg = 0;
+    memcpy(&sizeHdr, hdr.data() + oh + 60, 4);
+    memcpy(&fileAlign, hdr.data() + oh + 36, 4);
+    memcpy(&sizeImg, hdr.data() + oh + 56, 4);
+    if (!fileAlign || (fileAlign & (fileAlign - 1))) fileAlign = 0x200;
+    if (!sizeHdr || sizeHdr > 0x100000 || !sizeImg || sizeImg > 0x80000000) { setStatus("Dump: insane sizes"); return; }
+    std::vector<BYTE> fhdr(sizeHdr);
+    if (dump_read_best(base, fhdr.data(), sizeHdr) != sizeHdr) { setStatus("Dump: header read failed"); return; }
+    size_t secTab = oh + optSz;
+    struct DumpSec { uint32_t vs = 0, va = 0; std::vector<BYTE> data; };
+    std::vector<DumpSec> secs;
+    auto align = [](uint32_t v, uint32_t a) -> uint32_t { return (v + a - 1) & ~(a - 1); };
+    for (int i = 0; i < nSec; i++) {
+        size_t e = secTab + (size_t)i * 40;
+        if (e + 40 > fhdr.size()) { setStatus("Dump: section table OOB"); return; }
+        DumpSec s{};
+        memcpy(&s.vs, fhdr.data() + e + 8, 4);
+        memcpy(&s.va, fhdr.data() + e + 12, 4);
+        uint32_t memSz = s.vs;
+        if (!memSz) memcpy(&memSz, fhdr.data() + e + 16, 4);
+        if (s.va >= sizeImg) memSz = 0;
+        else if ((uint64_t)s.va + memSz > sizeImg) memSz = sizeImg - s.va;
+        if (memSz > 0x10000000) memSz = 0x10000000;
+        if (memSz) {
+            std::vector<BYTE> raw(memSz);
+            dump_read_best(base + s.va, raw.data(), memSz);
+            size_t keep = memSz;
+            if (memSz > 100) { // KsDumper-style trim: last nonzero + 4
+                size_t last = 0; bool any = false;
+                for (size_t k = 0; k < memSz; k++) if (raw[k]) { last = k; any = true; }
+                keep = !any ? 0 : (std::min<size_t>)(memSz, last + 4);
+            }
+            raw.resize(keep);
+            s.data.swap(raw);
+        }
+        secs.push_back(std::move(s));
+    }
+    // KsDumper parity (FixPEHeader/AlignSectionHeaders): bound-import + IAT dirs
+    // zeroed (IAT section marked R+W), extra dirs zeroed, VA/VS aligned to
+    // SectionAlignment, SizeOfImage + SizeOfHeaders recomputed.
+    uint32_t sectAlign = 0;
+    memcpy(&sectAlign, fhdr.data() + oh + 32, 4);
+    if (!sectAlign || (sectAlign & (sectAlign - 1))) sectAlign = 0x1000;
+    bool is64 = (magic == 0x20B);
+    uint32_t optSize = is64 ? 240 : 224;
+    size_t rvaCountOff = oh + (is64 ? 108 : 92);
+    size_t dirBase = oh + (is64 ? 112 : 96);
+    if (dirBase + 16 * 8 > fhdr.size()) { setStatus("Dump: dirs OOB"); return; }
+    uint32_t numRva = 0;
+    memcpy(&numRva, fhdr.data() + rvaCountOff, 4);
+    if (numRva > 16) numRva = 16;
+    uint32_t iatVA = 0;
+    if (numRva > 12) memcpy(&iatVA, fhdr.data() + dirBase + 12 * 8, 4);
+    for (uint32_t i = 0; i < 16; i++) {
+        if (i == 11 || i == 12 || i >= numRva) {
+            uint64_t zero = 0;
+            memcpy(fhdr.data() + dirBase + i * 8, &zero, 8);
+        }
+    }
+    uint32_t n16 = 16;
+    memcpy(fhdr.data() + rvaCountOff, &n16, 4);
+    uint16_t osz = (uint16_t)optSize;
+    memcpy(fhdr.data() + fh + 16, &osz, 2);
+    if (iatVA) {
+        for (size_t i = 0; i < secs.size(); i++) {
+            size_t e = secTab + i * 40;
+            uint32_t c = 0;
+            memcpy(&c, fhdr.data() + e + 36, 4);
+            uint32_t vs = secs[i].vs ? secs[i].vs : (uint32_t)secs[i].data.size();
+            if (secs[i].va <= iatVA && iatVA < secs[i].va + (vs ? vs : 1)) {
+                c |= 0x40000000 | 0x80000000;
+                memcpy(fhdr.data() + e + 36, &c, 4);
+            }
+        }
+    }
+    uint32_t maxEnd = 0;
+    for (size_t i = 0; i < secs.size(); i++) {
+        size_t e = secTab + i * 40;
+        uint32_t va = align(secs[i].va, sectAlign);
+        uint32_t vs = align(secs[i].vs ? secs[i].vs : (uint32_t)secs[i].data.size(), sectAlign);
+        memcpy(fhdr.data() + e + 8, &vs, 4);
+        memcpy(fhdr.data() + e + 12, &va, 4);
+        secs[i].va = va; secs[i].vs = vs;
+        if (va + vs > maxEnd) maxEnd = va + vs;
+    }
+    uint32_t newImg = align(maxEnd, sectAlign);
+    memcpy(fhdr.data() + oh + 56, &newImg, 4);
+    uint32_t newHdr = align((uint32_t)((uint32_t)lf + 4 + 20 + optSize + (uint32_t)nSec * 40), fileAlign);
+    memcpy(fhdr.data() + oh + 60, &newHdr, 4);
+    sizeHdr = newHdr;
+    uint32_t fileHdrSz = align(sizeHdr, fileAlign);
+    std::vector<BYTE> file;
+    file.insert(file.end(), fhdr.begin(), fhdr.end());
+    file.resize(fileHdrSz, 0);
+    for (size_t i = 0; i < secs.size(); i++) {
+        size_t e = secTab + i * 40;
+        uint32_t rawPtr = (uint32_t)file.size();
+        uint32_t rawSz = align((uint32_t)secs[i].data.size(), fileAlign);
+        if (secs[i].data.empty()) { rawPtr = fileHdrSz; rawSz = 0; }
+        memcpy(file.data() + e + 16, &rawSz, 4);
+        memcpy(file.data() + e + 20, &rawPtr, 4);
+        file.insert(file.end(), secs[i].data.begin(), secs[i].data.end());
+        file.resize(file.size() + (rawSz - (uint32_t)secs[i].data.size()), 0);
+    }
+    HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) { setStatus("Dump: cannot create file"); return; }
+    DWORD wr = 0;
+    BOOL ok = WriteFile(hf, file.data(), (DWORD)file.size(), &wr, nullptr);
+    CloseHandle(hf);
+    if (!ok || wr != file.size()) { setStatus("Dump: write failed"); return; }
+    char s[256]; snprintf(s, sizeof(s), "Dumped %s (%u sections, %.1f MB) -> %s", m.name.c_str(), nSec, file.size() / 1048576.0, path);
+    setStatus(s);
+}
+
+//=================================================================
 //  WndProcs
 //=================================================================
 static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -3540,6 +3738,26 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 DestroyWindow(h);
                 if (g_mv) { doMemDump(); doMemDisasm(); }
                 refresh_table();
+                return 0;
+            }
+            if (mode == 10) {
+                // Dump picker: module combo -> save dialog -> KsDumper-style dump
+                int sel = (int)SendMessageA(GetDlgItem(h, DLG_TYPE_CB), CB_GETCURSEL, 0, 0);
+                if (sel < 0 || (size_t)sel >= g_dumpMods.size()) { setStatus("Pick a module"); return 0; }
+                ModInfo m = g_dumpMods[(size_t)sel];
+                DestroyWindow(h);
+                char path[MAX_PATH]{};
+                snprintf(path, sizeof(path), "%s", m.name.c_str());
+                OPENFILENAMEA of{};
+                of.lStructSize = sizeof(of);
+                of.hwndOwner = g_hwnd;
+                of.lpstrFilter = "Executable (*.exe;*.dll)\0*.exe;*.dll\0Dump file (*.dmp)\0*.dmp\0All files (*.*)\0*.*\0";
+                of.nFilterIndex = 1;
+                of.lpstrFile = path;
+                of.nMaxFile = MAX_PATH;
+                of.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+                if (!GetSaveFileNameA(&of)) return 0;
+                doDumpModule(m, path);
                 return 0;
             }
             if (mode == 5) {
@@ -3832,6 +4050,8 @@ static HMENU BuildMenu() {
     HMENU p = CreatePopupMenu();
     AppendMenuA(p, MF_STRING, 9002, "Select Process...");
     AppendMenuA(p, MF_STRING, 9003, "Reload Driver");
+    AppendMenuA(p, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(p, MF_STRING, 9015, "Dump Process...");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)p, "Process");
     HMENU s = CreatePopupMenu();
     AppendMenuA(s, MF_STRING, 9004, "First Scan");
@@ -3951,6 +4171,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (id == CTX_DISM) { if (g_ctxFound) FoundDism(); else TableDism(); }
         else if (id == 9013) PS_ForTableRow();
         else if (id == 9003) { if (!g_connected) std::thread(DriverThread).detach(); }
+        else if (id == 9015) OpenDumpDialog();
         else if (id == IDC_FIRST_BTN || id == 9004) start_first();
         else if (id == IDC_NEXT_BTN || id == 9005) start_next();
         else if (id == IDC_UNDO_BTN || id == 9006) {
