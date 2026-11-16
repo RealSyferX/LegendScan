@@ -21,7 +21,8 @@ constexpr ULONG ls_scan_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C8, METHOD_B
 constexpr ULONG ls_query_code   = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C9, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr ULONG ls_mods_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CA, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr ULONG ls_inject_code  = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CB, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
-constexpr ULONG LS_BUILD_TAG    = 0x00080004; // +DLL inject (kernel LoadLibraryW remote thread)
+constexpr ULONG ls_force_code   = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CC, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+constexpr ULONG LS_BUILD_TAG    = 0x00080005; // +FORCE write (commit RESERVE + strip GUARD/RO, kernel VirtualProtect-style)
 
 struct info_t {
     HANDLE  target_pid;
@@ -488,6 +489,109 @@ static NTSTATUS MdlWrite(PEPROCESS proc, PVOID target, PVOID src, SIZE_T sz, PSI
     } __except (EXCEPTION_EXECUTE_HANDLER) { st = GetExceptionCode(); }
     KeUnstackDetachProcess(&apc);
     if (written) *written = done;
+    return st;
+}
+
+// ZwProtectVirtualMemory: resolved dynamically (zero link risk, codebase style)
+typedef NTSTATUS(NTAPI* ZwProtectVirtualMemory_t)(
+    HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize,
+    ULONG NewProtect, PULONG OldProtect);
+
+//=================================================================
+//  FORCE write — kernel VirtualProtect-style + commit-on-demand.
+//  Plain VirtualProtect can NEVER make RESERVE memory writable (no
+//  physical pages exist) — so this commits first via
+//  ZwAllocateVirtualMemory(MEM_COMMIT), strips PAGE_GUARD / read-only
+//  via ZwProtectVirtualMemory(RWX), writes (MmCopy, MDL fallback),
+//  then restores the original protect when it changed one.
+//  Trace bits in outTrace: 0=entered 1=queried 2=committed
+//  3=unprotected 4=mmcopy 5=mdl 6=restored.
+//  Returns the WRITE ntstatus (transport always STATUS_SUCCESS).
+//  HARD RULE: usermode targets only, request capped at 64KB.
+//=================================================================
+static NTSTATUS KernelForceWrite(PEPROCESS proc, HANDLE hProc, PVOID target,
+    PVOID srcScannerVA, SIZE_T sz, UINT64* outTrace) {
+    UINT64 trace = 0;
+    if (outTrace) *outTrace = 0;
+    if (!proc || !hProc || !target || !srcScannerVA || !sz || sz > 0x10000)
+        return STATUS_INVALID_PARAMETER;
+    {
+        ULONG_PTR a = (ULONG_PTR)target;
+        constexpr ULONG_PTR kMaxUser = 0x7FFFFFFFFFFFULL;
+        if (a == 0 || a > kMaxUser || a + sz < a || a + sz - 1 > kMaxUser)
+            return STATUS_ACCESS_VIOLATION;
+    }
+    trace |= (1ULL << 0);
+    // 1. query the region
+    MEMORY_BASIC_INFORMATION mbi{};
+    SIZE_T retLen = 0;
+    PVOID q = (PVOID)((ULONG_PTR)target & ~(PAGE_SIZE - 1));
+    NTSTATUS st = ZwQueryVirtualMemory(hProc, q, MemoryBasicInformation, &mbi, sizeof(mbi), &retLen);
+    if (!NT_SUCCESS(st)) { if (outTrace) *outTrace = trace; return st; }
+    trace |= (1ULL << 1);
+    // 2. commit when RESERVE (this is the step VirtualProtect cannot do)
+    if (mbi.State == MEM_RESERVE) {
+        PVOID cbase = (PVOID)((ULONG_PTR)target & ~(PAGE_SIZE - 1));
+        SIZE_T csize = (((ULONG_PTR)target + sz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)) - (ULONG_PTR)cbase;
+        st = ZwAllocateVirtualMemory(hProc, &cbase, 0, &csize, MEM_COMMIT, PAGE_READWRITE);
+        if (!NT_SUCCESS(st)) { if (outTrace) *outTrace = trace; return st; }
+        trace |= (1ULL << 2);
+        st = ZwQueryVirtualMemory(hProc, q, MemoryBasicInformation, &mbi, sizeof(mbi), &retLen);
+        if (!NT_SUCCESS(st)) { if (outTrace) *outTrace = trace; return st; }
+    }
+    if (mbi.State != MEM_COMMIT) { if (outTrace) *outTrace = trace; return STATUS_INVALID_ADDRESS; }
+    // 3. strip GUARD / force RW when the page is not writable
+    ULONG baseProt = mbi.Protect & 0xFF;
+    bool writable = (baseProt == 0x04 || baseProt == 0x08 || baseProt == 0x40 || baseProt == 0x80 || baseProt == 0x0C);
+    bool guarded = (mbi.Protect & PAGE_GUARD) != 0;
+    ULONG oldProt = 0;
+    bool changed = false;
+    if (!writable || guarded) {
+        UNICODE_STRING zpn; RtlInitUnicodeString(&zpn, L"ZwProtectVirtualMemory");
+        auto pProt = (ZwProtectVirtualMemory_t)MmGetSystemRoutineAddress(&zpn);
+        if (!pProt) { if (outTrace) *outTrace = trace; return STATUS_PROCEDURE_NOT_FOUND; }
+        PVOID pbase = mbi.BaseAddress;
+        SIZE_T psize = (SIZE_T)((ULONG_PTR)target + sz - (ULONG_PTR)mbi.BaseAddress);
+        st = pProt(hProc, &pbase, &psize, PAGE_EXECUTE_READWRITE, &oldProt);
+        if (!NT_SUCCESS(st)) { if (outTrace) *outTrace = trace; return st; }
+        changed = true;
+        trace |= (1ULL << 3);
+    }
+    // 4. pull source bytes into a kernel temp (caller VA via MmCopy)
+    PUCHAR tmp = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, sz, 'LSfw');
+    if (!tmp) st = STATUS_INSUFFICIENT_RESOURCES;
+    else {
+        SIZE_T got = 0;
+        st = SafeCopy(PsGetCurrentProcess(), srcScannerVA, PsGetCurrentProcess(), tmp, sz, &got);
+        if (!NT_SUCCESS(st) || got != sz) {
+            ExFreePoolWithTag(tmp, 'LSfw');
+            tmp = nullptr;
+        }
+    }
+    // 5. write: MmCopy first, MDL writable-map fallback (covers RO code too)
+    if (tmp) {
+        SIZE_T wrote = 0;
+        st = SafeCopy(PsGetCurrentProcess(), tmp, proc, target, sz, &wrote);
+        if (NT_SUCCESS(st) && wrote == sz) trace |= (1ULL << 4);
+        else {
+            SIZE_T mw = 0;
+            st = MdlWrite(proc, target, tmp, sz, &mw);
+            if (NT_SUCCESS(st) && mw == sz) trace |= (1ULL << 5);
+        }
+        ExFreePoolWithTag(tmp, 'LSfw');
+    }
+    // 6. restore original protect when we changed it
+    if (changed) {
+        UNICODE_STRING zpn2; RtlInitUnicodeString(&zpn2, L"ZwProtectVirtualMemory");
+        auto pProt2 = (ZwProtectVirtualMemory_t)MmGetSystemRoutineAddress(&zpn2);
+        if (pProt2) {
+            PVOID rbase = mbi.BaseAddress;
+            SIZE_T rsize = (SIZE_T)((ULONG_PTR)target + sz - (ULONG_PTR)mbi.BaseAddress);
+            ULONG dummy = 0;
+            if (NT_SUCCESS(pProt2(hProc, &rbase, &rsize, oldProt, &dummy))) trace |= (1ULL << 6);
+        }
+    }
+    if (outTrace) *outTrace = trace;
     return st;
 }
 
@@ -1040,6 +1144,29 @@ NTSTATUS ctl_io(PDEVICE_OBJECT dev, PIRP irp) {
             }
         }
         ObDereferenceObject(proc);
+        break;
+    }
+    case ls_force_code: {
+        if (!sysbuf || inLen < sizeof(info_t) || outLen < sizeof(info_t)) { status = STATUS_INVALID_PARAMETER; break; }
+        auto buf = (info_t*)sysbuf;
+        if (buf->size == 0 || buf->size > 0x10000) { status = STATUS_INVALID_PARAMETER; break; }
+        {
+            ULONG_PTR a = (ULONG_PTR)buf->target_address;
+            constexpr ULONG_PTR kMaxUser = 0x7FFFFFFFFFFFULL;
+            if (!a || a > kMaxUser || a + buf->size < a || a + buf->size - 1 > kMaxUser) { status = STATUS_ACCESS_VIOLATION; break; }
+        }
+        PEPROCESS proc = AcquireTargetRef();
+        if (!proc) { status = STATUS_INVALID_HANDLE; break; }
+        HANDLE hProc = nullptr;
+        status = OpenTarget(&hProc, proc);
+        if (!NT_SUCCESS(status)) { ObDereferenceObject(proc); break; }
+        UINT64 trace = 0;
+        NTSTATUS wst = KernelForceWrite(proc, hProc, buf->target_address, buf->buffer_address, buf->size, &trace);
+        buf->return_size = (SIZE_T)wst; // real write NTSTATUS for usermode
+        buf->size = (SIZE_T)trace;      // step trace (size unused for force)
+        ZwClose(hProc);
+        ObDereferenceObject(proc);
+        status = STATUS_SUCCESS; // transport OK: guarantees output copy-back
         break;
     }
     case ls_alloc_code: {

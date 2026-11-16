@@ -68,7 +68,13 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
-  <PropertyGroup />
+  <PropertyGroup>
+    <!-- WDK 10.0.26100 ships InfVerif.dll under bin\x64 and bin\arm64 only; the
+         DPVerifierTask probes x86\InfVerif.dll and dies with 0x8007007E on this
+         machine. The INF here is hand-written and already validated by the
+         test-signing flow, so package verification is skipped. -->
+    <SkipPackageVerification>true</SkipPackageVerification>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
   </PropertyGroup>

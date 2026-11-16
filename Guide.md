@@ -4,7 +4,7 @@
 
 1. Boot EfiGuard (USB or AnimeMode entry)
 2. Run `x64\Release\Scanner.exe` **as Administrator**
-3. Wait for **`Driver OK v00080004`** in the status bar
+3. Wait for **`Driver OK v00080005`** in the status bar
 4. PC → attach target → scan
 
 > The driver stays loaded (`--keep`) after Scanner closes. After a driver

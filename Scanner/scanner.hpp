@@ -19,7 +19,8 @@ constexpr DWORD ls_scan_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C8, METHOD_B
 constexpr DWORD ls_query_code   = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19C9, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr DWORD ls_mods_code    = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CA, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
 constexpr DWORD ls_inject_code  = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CB, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
-constexpr DWORD LS_BUILD_TAG    = 0x00080004;
+constexpr DWORD ls_force_code   = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x19CC, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+constexpr DWORD LS_BUILD_TAG    = 0x00080005;
 
 #define LS_MODS_MAX 128
 struct ls_kmod_t {
@@ -185,8 +186,23 @@ public:
         }
         return done == sz;
     }
+    // Bulk write: ONE ioctl for any size (driver does MDL fallback inside).
+    // Falls back to per-qword/byte loop only if bulk fails.
+    bool write_bulk(UINT64 addr, const void* data, SIZE_T sz) {
+        if (!is_user_range(addr, sz) || !sz) return false;
+        ls_info_t io{};
+        io.target_address = addr;
+        io.buffer_address = (UINT64)data;
+        io.size = sz;
+        DWORD br = 0;
+        if (!DeviceIoControl(m_h, ls_write_code, &io, sizeof(io), &io, sizeof(io), &br, nullptr)) return false;
+        return io.return_size == sz;
+    }
     bool write_bytes(UINT64 addr, const void* data, SIZE_T sz) {
         if (!is_user_range(addr, sz)) return false;
+        // Try bulk first — one MDL-mapped write, handles PAGE_READONLY pages
+        if (write_bulk(addr, data, sz)) return true;
+        // Bulk failed (e.g. partial or guarded page) -> retry chunked
         const BYTE* src = (const BYTE*)data;
         SIZE_T done = 0;
         while (done + 8 <= sz) {
@@ -197,6 +213,7 @@ public:
         while (done < sz) { if (!wpm<BYTE>(addr + done, src[done])) return false; done++; }
         return true;
     }
+    DWORD last_error() const { return GetLastError(); }
     // Kernel scan one region — returns hits (VA)
     std::vector<UINT64> kscan(UINT64 start, SIZE_T sz, const UCHAR* pat, const UCHAR* msk, ULONG patLen, ULONG cap = 256) {
         std::vector<UINT64> out;
@@ -276,6 +293,27 @@ public:
         DWORD br = 0;
         if (!DeviceIoControl(m_h, ls_alloc_code, &io, sizeof(io), &io, sizeof(io), &br, nullptr)) return nullptr;
         return io.base_address;
+    }
+    // Kernel FORCE write: commits RESERVE pages + strips GUARD/RO (kernel
+    // VirtualProtect-style via ZwAllocateVirtualMemory/ZwProtectVirtualMemory),
+    // then writes (MmCopy, MDL fallback). Explicit opt-in ONLY — committing a
+    // garbage address writes to a page the game never reads. Real write
+    // NTSTATUS via stOut, step-trace via traceOut (bits: 0=entered 1=queried
+    // 2=committed 3=unprotected 4=mmcopy 5=mdl 6=restored).
+    bool force_write(UINT64 addr, const void* data, SIZE_T sz, LONG* stOut = nullptr, UINT64* traceOut = nullptr) {
+        if (stOut) *stOut = (LONG)ERROR_INVALID_PARAMETER;
+        if (traceOut) *traceOut = 0;
+        if (!is_user_range(addr, sz) || !sz || sz > 0x10000) return false;
+        ls_info_t io{};
+        io.target_address = addr;
+        io.buffer_address = (UINT64)data;
+        io.size = sz;
+        DWORD br = 0;
+        BOOL ok = DeviceIoControl(m_h, ls_force_code, &io, sizeof(io), &io, sizeof(io), &br, nullptr);
+        if (stOut) *stOut = ok ? (LONG)(LONG_PTR)io.return_size : (LONG)GetLastError();
+        if (traceOut) *traceOut = ok ? io.size : 0;
+        if (!ok) return false;
+        return (LONG)(LONG_PTR)io.return_size >= 0; // NT_SUCCESS
     }
     // Kernel LdrLoadDll-stub injection. Returns loaded module base (NULL on
     // fail), NTSTATUS via stOut, step-trace via traceOut (bits: 0=entered

@@ -278,7 +278,7 @@ enum {
     SET_MODCHK = 1040,
     // mem viewer popup
     MV_X = 1100, MV_ADDR_EDIT, MV_SIZE_EDIT, MV_DUMP_BTN, MV_WRITE_EDIT, MV_WRITE_BTN, MV_HEX_EDIT,
-    MV_DIS_LIST, MV_DIS_BTN,
+    MV_DIS_LIST, MV_DIS_BTN, MV_FORCE_BTN = 1109,
 };
 static HWND g_ctl[1200]{};
 static HWND ctl(int id) { return (id >= 0 && id < 1200) ? g_ctl[id] : nullptr; }
@@ -496,6 +496,58 @@ static bool exec_protect(ULONG p) {
 static bool cow_protect(ULONG p) {
     ULONG base = p & 0xFF;
     return (base == 0x08 || base == 0x80);
+}
+// Human-readable region decode for diagnostics (MEM_* / PAGE_* constants)
+static void fmt_region(char* out, size_t n, const LsRegion& q) {
+    const char* st = (q.state == 0x1000) ? "COMMIT" : (q.state == 0x2000) ? "RESERVE" : (q.state == 0x10000) ? "FREE" : "?STATE";
+    const char* ty = (q.type == 0x20000) ? "PRIVATE" : (q.type == 0x40000) ? "MAPPED" : (q.type == 0x1000000) ? "IMAGE" : "?TYPE";
+    ULONG base = q.protect & 0xFF;
+    const char* pr;
+    switch (base) {
+    case 0x00: pr = "ZERO/RSV"; break;
+    case 0x01: pr = "NOACCESS"; break;
+    case 0x02: pr = "R"; break;
+    case 0x04: pr = "RW"; break;
+    case 0x08: pr = "WC"; break;
+    case 0x10: pr = "X"; break;
+    case 0x20: pr = "RX"; break;
+    case 0x40: pr = "RWX"; break;
+    case 0x80: pr = "WCX"; break;
+    default: pr = "?PROT"; break;
+    }
+    snprintf(out, n, "[%llX sz %llX %s/%s%s %s]",
+        (unsigned long long)q.base, (unsigned long long)q.size,
+        st, pr, (q.protect & 0x100) ? "+G" : "", ty);
+}
+static const char* winerr_name(DWORD e) {
+    switch (e) {
+    case 5: return "ACCESS_DENIED";
+    case 299: return "PARTIAL_COPY";
+    case 487: return "BAD_ADDRESS";
+    case 998: return "NOACCESS";
+    default: return "";
+    }
+}
+// Pre-write validation: final address must be committed + readable.
+// Catches the classic mistake of dereferencing CODE bytes as a pointer
+// (chain lands in RESERVE/NOACCESS instead of real data memory).
+static bool check_final_usable(UINT64 f, char* why, size_t wn) {
+    if (!g_drv || !g_attached) { snprintf(why, wn, "Attach first"); return false; }
+    LsRegion q{};
+    if (!g_drv->vquery(f, q)) {
+        snprintf(why, wn, "Bad pointer @%llX (unmapped memory)", (unsigned long long)f);
+        return false;
+    }
+    char rg[96]; fmt_region(rg, sizeof(rg), q);
+    if (q.state != 0x1000) {
+        snprintf(why, wn, "Bad pointer @%llX %s — not data (chain wrong? MemView Force overrides)", (unsigned long long)f, rg);
+        return false;
+    }
+    if (!readable_protect(q.protect)) {
+        snprintf(why, wn, "Bad pointer @%llX %s — page unreadable", (unsigned long long)f, rg);
+        return false;
+    }
+    return true;
 }
 struct ModInfo { std::string name; UINT64 base = 0; UINT64 size = 0; };
 static std::vector<ModInfo> g_mods;
@@ -897,7 +949,7 @@ static void NextScanThread(std::string s1, std::string s2, int vtype, int stype,
     g_scanning = false;
 }
 
-// Freeze thread — rewrites Active table entries
+// Freeze thread — rewrites Active table entries (bulk MDL write, handles RO pages)
 static std::atomic<bool> g_freezeRun{ true };
 static void FreezeThread() {
     HideThreadFromDebugger();
@@ -909,7 +961,9 @@ static void FreezeThread() {
             if (!e.active) continue;
             UINT64 f = e.addr;
             if (!entry_final(e, f)) continue;
-            g_drv->write_bytes(f, e.bytes, e.len);
+            // bulk first, chunked fallback — same path as Change Value
+            if (!g_drv->write_bulk(f, e.bytes, e.len))
+                g_drv->write_bytes(f, e.bytes, e.len);
         }
     }
 }
@@ -1370,6 +1424,18 @@ static void updateManualPreview(HWND h) {
             p = nxt;
         }
         if (ok && p) {
+            // Warn live when the chain lands outside committed data memory
+            // (e.g. dereferenced CODE bytes -> RESERVE/NOACCESS garbage)
+            LsRegion q{};
+            if (g_drv->vquery(p, q) && q.state != 0x1000) {
+                char rg[96]; fmt_region(rg, sizeof(rg), q);
+                chain += "\r\n!! target ";
+                chain += rg;
+                chain += " — NOT data memory, chain is wrong";
+                ok = false;
+            }
+        }
+        if (ok && p) {
             BYTE cur[32]{};
             g_drv->read_raw(p, cur, len);
             std::string vs = fmt_valx(rv, cur, len, isHex, isSgn);
@@ -1421,12 +1487,18 @@ static bool parse_entry_value(const TblEntry& e, const char* txt, bool hex, BYTE
     return true;
 }
 static void layoutManualDlg(HWND h) {
-    // small (plain address) vs big (pointer chain) layout
+    // small (plain address) vs big (pointer chain) layout.
+    // Chain box is tall on purpose: base + per-hop lines + !! warning = 5 rows.
     bool isPtr = SendMessageA(GetDlgItem(h, DLG_PTR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    int okY = isPtr ? 424 : 222;
+    int okY = isPtr ? 472 : 222;
     SetWindowPos(GetDlgItem(h, DLG_OK_BTN), nullptr, 12, okY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
     SetWindowPos(GetDlgItem(h, DLG_CANCEL_BTN), nullptr, 152, okY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-    SetWindowPos(h, nullptr, 0, 0, 300, isPtr ? 510 : 300, SWP_NOMOVE | SWP_NOZORDER);
+    SetWindowPos(h, nullptr, 0, 0, 300, isPtr ? 558 : 300, SWP_NOMOVE | SWP_NOZORDER);
+    if (isPtr) {
+        SetWindowPos(GetDlgItem(h, DLG_CHAIN), nullptr, 12, 344, 260, 92, SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(h, DLG_ADD_OFF), nullptr, 12, 440, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(h, DLG_REM_OFF), nullptr, 142, 440, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    }
     for (int i = 0; i < PTR_MAX; i++) {
         HWND oe = GetDlgItem(h, dlgOffId(i));
         if (oe) ShowWindow(oe, (isPtr && i < g_dlgNOff) ? SW_SHOW : SW_HIDE);
@@ -1951,6 +2023,18 @@ static std::vector<std::string> g_disText;
 static std::vector<int> g_disLen;
 static UINT64 g_asmAddr = 0;
 static UINT64 g_mvGoAddr = 0; // Go-to-Dism pending address (consumed by OpenMemView)
+// Insert an explanatory row when there is nothing to disassemble
+// (beats a blank list that looks like a rendering bug)
+static void disasm_note(HWND lv, UINT64 addr, const char* ops) {
+    LVITEMA it{}; it.mask = LVIF_TEXT;
+    char a[32]; snprintf(a, sizeof(a), "%llX", (unsigned long long)addr);
+    int row = (int)g_disAddr.size();
+    g_disAddr.push_back(addr); g_disText.push_back(ops); g_disLen.push_back(1);
+    it.iItem = row; it.iSubItem = 0; it.pszText = a;
+    SendMessageA(lv, LVM_INSERTITEMA, 0, (LPARAM)&it);
+    lv_set_text(lv, row, 1, (LPSTR)"??");
+    lv_set_text(lv, row, 2, (LPSTR)ops);
+}
 static void doMemDisasm() {
     HWND lv = g_mv ? GetDlgItem(g_mv, MV_DIS_LIST) : nullptr;
     if (!lv) return;
@@ -1959,9 +2043,20 @@ static void doMemDisasm() {
     if (!g_drv || !g_attached) return;
     UINT64 addr = strtoull(dlgText(g_mv, MV_ADDR_EDIT).c_str(), nullptr, 16);
     if (!addr) return;
+    // Uncommitted/unreadable pages read back as zeros — say so up front
+    // instead of showing an empty list
+    LsRegion dq{};
+    bool haveQ = g_drv->vquery(addr, dq);
+    if (!haveQ || dq.state != 0x1000 || !readable_protect(dq.protect)) {
+        char note[200];
+        if (haveQ) { char rg[96]; fmt_region(rg, sizeof(rg), dq); snprintf(note, sizeof(note), "!! unreadable %s — not committed code/data", rg); }
+        else snprintf(note, sizeof(note), "!! unreadable — address unmapped");
+        disasm_note(lv, addr, note);
+        return;
+    }
     const SIZE_T kRead = 512;
     std::vector<BYTE> buf(kRead);
-    g_drv->read_raw(addr, buf.data(), kRead);
+    if (!g_drv->read_bulk(addr, buf.data(), kRead)) g_drv->read_raw(addr, buf.data(), kRead);
     LVITEMA it{}; it.mask = LVIF_TEXT;
     char a[32], bs[64];
     int zeros = 0;
@@ -1987,6 +2082,8 @@ static void doMemDisasm() {
         lv_set_text(lv, row, 2, (LPSTR)ops.c_str());
         off += (SIZE_T)len;
     }
+    if (g_disAddr.empty())
+        disasm_note(lv, addr, "!! all zeros — nothing to disassemble (wrong address?)");
 }
 static void OpenAsmDialog(UINT64 addr, const char* curText) {
     if (g_dlg) { SetForegroundWindow(g_dlg); return; }
@@ -2037,8 +2134,9 @@ static void OpenMemView() {
     c("EDIT", "256", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 275, 10, 60, 24, MV_SIZE_EDIT);
     c("BUTTON", "Dump", BS_PUSHBUTTON, 345, 9, 70, 26, MV_DUMP_BTN);
     c("BUTTON", "Disasm", BS_PUSHBUTTON, 420, 9, 70, 26, MV_DIS_BTN);
-    c("EDIT", "90 90 90", WS_BORDER | ES_AUTOHSCROLL, 495, 10, 150, 24, MV_WRITE_EDIT);
-    c("BUTTON", "Write", BS_PUSHBUTTON, 650, 9, 80, 26, MV_WRITE_BTN);
+    c("EDIT", "90 90 90", WS_BORDER | ES_AUTOHSCROLL, 495, 10, 100, 24, MV_WRITE_EDIT);
+    c("BUTTON", "Write", BS_PUSHBUTTON, 600, 9, 60, 26, MV_WRITE_BTN);
+    c("BUTTON", "Force", BS_PUSHBUTTON, 665, 9, 65, 26, MV_FORCE_BTN);
     HWND lv = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 12, 44, 720, 190, p, (HMENU)(INT_PTR)MV_DIS_LIST, GetModuleHandleA(nullptr), nullptr);
     ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
     {
@@ -2061,8 +2159,18 @@ static void doMemDump() {
     SIZE_T size = (SIZE_T)strtoul(sz.c_str(), nullptr, 0);
     if (!size || size > 0x10000) size = 256;
     std::vector<BYTE> buf(size);
-    g_drv->read_raw(addr, buf.data(), size);
+    if (!g_drv->read_bulk(addr, buf.data(), size)) g_drv->read_raw(addr, buf.data(), size);
     std::string out;
+    // Uncommitted pages read back as zeros — label them so zeros aren't
+    // mistaken for real data
+    {
+        LsRegion dq{};
+        if (g_drv->vquery(addr, dq) && dq.state != 0x1000) {
+            char rg[96]; fmt_region(rg, sizeof(rg), dq);
+            char warn[220]; snprintf(warn, sizeof(warn), "!! region %s — UNCOMMITTED, bytes below read as zeros (not real data)\r\n", rg);
+            out += warn;
+        }
+    }
     char line[160];
     for (SIZE_T row = 0; row < size; row += 16) {
         char h[80]{}, asc[20]{};
@@ -2098,12 +2206,75 @@ static void doMemWrite() {
         bytes.push_back((BYTE)((hi << 4) | lo)); p += 2;
     }
     if (bytes.empty()) return;
-    if (g_drv->write_bytes(addr, bytes.data(), bytes.size())) {
+    bool ok = g_drv->write_bulk(addr, bytes.data(), bytes.size());
+    if (!ok) ok = g_drv->write_bytes(addr, bytes.data(), bytes.size());
+    if (ok) {
         BYTE chk[256]{};
-        g_drv->read_raw(addr, chk, bytes.size());
-        SetDlgItemTextA(g_mv, MV_HEX_EDIT, memcmp(chk, bytes.data(), bytes.size()) == 0 ? "Write OK (verified)." : "Write verify FAILED.");
+        if (!g_drv->read_bulk(addr, chk, bytes.size())) g_drv->read_raw(addr, chk, bytes.size());
+        if (memcmp(chk, bytes.data(), bytes.size()) == 0) SetDlgItemTextA(g_mv, MV_HEX_EDIT, "Write OK (verified).");
+        else {
+            LsRegion qv{}; char msg[220];
+            if (g_drv->vquery(addr, qv)) snprintf(msg, sizeof(msg), "Write verify FAILED @%llX prot %02lX", (unsigned long long)addr, qv.protect);
+            else snprintf(msg, sizeof(msg), "Write verify FAILED.");
+            SetDlgItemTextA(g_mv, MV_HEX_EDIT, msg);
+        }
     }
-    else SetDlgItemTextA(g_mv, MV_HEX_EDIT, "Write FAILED.");
+    else {
+        LsRegion qv{}; char msg[300];
+        DWORD le = GetLastError();
+        if (g_drv->vquery(addr, qv)) {
+            char rg[96]; fmt_region(rg, sizeof(rg), qv);
+            const char* en = winerr_name(le);
+            snprintf(msg, sizeof(msg), "Write FAILED @%llX err=%lu%s%s %s", (unsigned long long)addr, (unsigned long)le, en[0] ? " " : "", en, rg);
+        }
+        else snprintf(msg, sizeof(msg), "Write FAILED err=%lu (query failed)", (unsigned long)le);
+        SetDlgItemTextA(g_mv, MV_HEX_EDIT, msg);
+    }
+}
+// FORCE write — kernel commit (RESERVE->COMMIT) + strip GUARD/RO + write.
+// Explicit opt-in only: use when Write fails on a page you KNOW is the real
+// target (guard pages, reserved arenas). Firing it at a garbage address
+// commits a page the game never reads — changes nothing, risks a crash.
+static void doMemForceWrite() {
+    if (!g_mv) return;
+    if (!g_drv || !g_attached) return;
+    std::string a = dlgText(g_mv, MV_ADDR_EDIT);
+    std::string hb = dlgText(g_mv, MV_WRITE_EDIT);
+    UINT64 addr = strtoull(a.c_str(), nullptr, 16); // CE: address boxes are hex
+    std::vector<BYTE> bytes;
+    const char* p = hb.c_str();
+    while (*p && bytes.size() < 256) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        if (*p == '?') { bytes.push_back(0); while (*p == '?') p++; continue; }
+        BYTE hi, lo;
+        if (!hexNib(p[0], hi)) break;
+        if (!p[1] || isspace((unsigned char)p[1])) { bytes.push_back((BYTE)(hi << 4)); p++; continue; }
+        if (!hexNib(p[1], lo)) break;
+        bytes.push_back((BYTE)((hi << 4) | lo)); p += 2;
+    }
+    if (bytes.empty()) return;
+    LONG st = 0; UINT64 tr = 0;
+    bool ok = g_drv->force_write(addr, bytes.data(), bytes.size(), &st, &tr);
+    char steps[160]{};
+    if (tr & (1ULL << 2)) snprintf(steps + strlen(steps), sizeof(steps) - strlen(steps), "%scommitted-reserve", steps[0] ? "," : "");
+    if (tr & (1ULL << 3)) snprintf(steps + strlen(steps), sizeof(steps) - strlen(steps), "%sstripped-prot", steps[0] ? "," : "");
+    if (tr & (1ULL << 4)) snprintf(steps + strlen(steps), sizeof(steps) - strlen(steps), "%smmcopy", steps[0] ? "," : "");
+    if (tr & (1ULL << 5)) snprintf(steps + strlen(steps), sizeof(steps) - strlen(steps), "%smdl", steps[0] ? "," : "");
+    if (tr & (1ULL << 6)) snprintf(steps + strlen(steps), sizeof(steps) - strlen(steps), "%srestored", steps[0] ? "," : "");
+    char msg[420];
+    if (ok) {
+        BYTE chk[256]{};
+        if (!g_drv->read_bulk(addr, chk, bytes.size())) g_drv->read_raw(addr, chk, bytes.size());
+        if (memcmp(chk, bytes.data(), bytes.size()) == 0)
+            snprintf(msg, sizeof(msg), "Force OK (verified) @%llX [%s]. If the game value didn't change, this address was never the variable.", (unsigned long long)addr, steps);
+        else
+            snprintf(msg, sizeof(msg), "Force wrote but verify MISMATCH @%llX [%s] — page rejected bytes (wrong address?).", (unsigned long long)addr, steps);
+    }
+    else {
+        snprintf(msg, sizeof(msg), "Force FAILED @%llX st=%ld trace=%llX [%s].", (unsigned long long)addr, st, (unsigned long long)tr, steps[0] ? steps : "no-steps");
+    }
+    SetDlgItemTextA(g_mv, MV_HEX_EDIT, msg);
 }
 //=================================================================
 //  Single-line assembler (pairs with xa_decode above)
@@ -3760,10 +3931,44 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (!parse_entry_value(e, t.c_str(), e.hexDisp, nb)) { SetFocus(GetDlgItem(h, DLG_VAL_EDIT)); return 0; }
                 UINT64 f = e.addr;
                 if (!g_drv || !g_attached || !entry_final(e, f)) { setStatus("Attach first"); DestroyWindow(h); return 0; }
-                if (!g_drv->write_bytes(f, nb, e.len)) { setStatus("Write FAILED"); DestroyWindow(h); return 0; }
+                // Pre-flight: refuse RESERVE/NOACCESS targets with a clear reason
+                // instead of a cryptic driver error (usually a bad pointer chain)
+                {
+                    char why[256];
+                    if (!check_final_usable(f, why, sizeof(why))) { setStatus(why); DestroyWindow(h); return 0; }
+                }
+                // Try bulk write first (single MDL-mapped IOCTL), handles PAGE_READONLY
+                bool ok = g_drv->write_bulk(f, nb, e.len);
+                if (!ok) ok = g_drv->write_bytes(f, nb, e.len);
+                if (!ok) {
+                    DWORD le = GetLastError();
+                    LsRegion qr{};
+                    char diag[300];
+                    if (g_drv->vquery(f, qr)) {
+                        char rg[96]; fmt_region(rg, sizeof(rg), qr);
+                        const char* en = winerr_name(le);
+                        snprintf(diag, sizeof(diag), "Write FAILED @%llX err=%lu%s%s %s",
+                            (unsigned long long)f, (unsigned long)le,
+                            en[0] ? " " : "", en, rg);
+                    } else {
+                        snprintf(diag, sizeof(diag), "Write FAILED @%llX err=%lu (query failed)", (unsigned long long)f, (unsigned long)le);
+                    }
+                    setStatus(diag);
+                    // also dump region info to debug console for deep trace
+                    char dbg[320]; snprintf(dbg, sizeof(dbg), "[LS] Write fail target %llX len %lu err %lu\n", (unsigned long long)f, e.len, (unsigned long)le);
+                    OutputDebugStringA(dbg);
+                    DestroyWindow(h); return 0;
+                }
                 BYTE rb[32]{};
-                g_drv->read_raw(f, rb, e.len);
-                if (memcmp(rb, nb, e.len) != 0) setStatus("Write verify FAILED");
+                // use bulk read for verify when possible
+                if (!g_drv->read_bulk(f, rb, e.len)) g_drv->read_raw(f, rb, e.len);
+                if (memcmp(rb, nb, e.len) != 0) {
+                    LsRegion qv{};
+                    char vdiag[220];
+                    if (g_drv->vquery(f, qv)) snprintf(vdiag, sizeof(vdiag), "Write verify FAILED @%llX prot %02lX (readback mismatch)", (unsigned long long)f, qv.protect);
+                    else snprintf(vdiag, sizeof(vdiag), "Write verify FAILED @%llX", (unsigned long long)f);
+                    setStatus(vdiag);
+                }
                 else {
                     std::lock_guard<std::mutex> lk(g_tableMtx);
                     if ((size_t)g_editRow < g_table.size()) memcpy(g_table[(size_t)g_editRow].bytes, nb, e.len);
@@ -3857,9 +4062,16 @@ static LRESULT CALLBACK ManualProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 int n = AssembleLine(t.c_str(), g_asmAddr, enc, aerr, sizeof(aerr));
                 if (n <= 0) { setStatus(aerr); SetFocus(GetDlgItem(h, DLG_VAL_EDIT)); return 0; }
                 if (!g_drv || !g_attached) { setStatus("Attach first"); DestroyWindow(h); return 0; }
-                if (!g_drv->write_bytes(g_asmAddr, enc, (SIZE_T)n)) { setStatus("Assemble write FAILED"); DestroyWindow(h); return 0; }
+                bool aok = g_drv->write_bulk(g_asmAddr, enc, (SIZE_T)n);
+                if (!aok) aok = g_drv->write_bytes(g_asmAddr, enc, (SIZE_T)n);
+                if (!aok) {
+                    LsRegion qa{}; char amsg[260]; DWORD ale = GetLastError();
+                    if (g_drv->vquery(g_asmAddr, qa)) snprintf(amsg, sizeof(amsg), "Assemble write FAILED @%llX err=%lu prot %02lX", (unsigned long long)g_asmAddr, (unsigned long)ale, qa.protect);
+                    else snprintf(amsg, sizeof(amsg), "Assemble write FAILED err=%lu", (unsigned long)ale);
+                    setStatus(amsg); DestroyWindow(h); return 0;
+                }
                 BYTE rb[16]{};
-                g_drv->read_raw(g_asmAddr, rb, (SIZE_T)n);
+                if (!g_drv->read_bulk(g_asmAddr, rb, (SIZE_T)n)) g_drv->read_raw(g_asmAddr, rb, (SIZE_T)n);
                 if (memcmp(rb, enc, (SIZE_T)n) != 0) setStatus("Assemble verify FAILED");
                 else {
                     char s[128]; snprintf(s, sizeof(s), "Assembled %d byte(s) at %llX", n, (unsigned long long)g_asmAddr);
@@ -3995,6 +4207,7 @@ static LRESULT CALLBACK MemProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int id = LOWORD(w);
         if (id == MV_DUMP_BTN) doMemDump();
         else if (id == MV_WRITE_BTN) doMemWrite();
+        else if (id == MV_FORCE_BTN) doMemForceWrite();
         else if (id == MV_DIS_BTN) { doMemDump(); doMemDisasm(); }
         return 0;
     }
@@ -4344,7 +4557,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowTextA(ctl(IDC_START_EDIT), a);
             SetWindowTextA(ctl(IDC_STOP_EDIT), b);
         }
-        else if (id == 9008) MessageBoxA(hwnd, "LegendScan — kernel CE clone\nDriver: amdfend.sys (AMD_CrashDefend)\nBuild tag 00080004", "About", MB_OK);
+        else if (id == 9008) MessageBoxA(hwnd, "LegendScan — kernel CE clone\nDriver: amdfend.sys (AMD_CrashDefend)\nBuild tag 00080005", "About", MB_OK);
         return 0;
     }
     case WM_NOTIFY: {
